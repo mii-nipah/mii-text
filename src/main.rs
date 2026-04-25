@@ -27,11 +27,27 @@ struct Args {
     messages: Option<String>,
     quick: bool,
     stateful: Option<PathBuf>,
+    reasoning: Option<String>,
 }
 
 fn usage() -> &'static str {
     "usage: mii-text [--key <s>] [--url <s>] [--model <s>] [--stream] [--out <path>]\n\
-                    [--system <s>] [--messages <json>] [--quick] [--stateful <path>]"
+                    [--system <s>] [--messages <json>] [--quick] [--stateful <path>]\n\
+                    [--reasoning <none|low|medium|high|xhigh>]"
+}
+
+fn map_reasoning(level: &str) -> Result<&'static str, String> {
+    match level {
+        "none" => Ok("minimal"),
+        "low" => Ok("low"),
+        "medium" => Ok("medium"),
+        "high" => Ok("high"),
+        "xhigh" => Ok("high"),
+        other => Err(format!(
+            "invalid --reasoning value '{}': expected none|low|medium|high|xhigh",
+            other
+        )),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
             "--messages" => args.messages = Some(need(&mut it, "--messages")?),
             "--quick" => args.quick = true,
             "--stateful" => args.stateful = Some(PathBuf::from(need(&mut it, "--stateful")?)),
+            "--reasoning" => args.reasoning = Some(need(&mut it, "--reasoning")?),
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -198,11 +215,15 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
     conversation.extend(new_messages);
 
     let req_messages = build_request_messages(&args.system, &conversation);
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": req_messages,
         "stream": args.stream,
     });
+    if let Some(level) = &args.reasoning {
+        let mapped = map_reasoning(level).map_err(|e| (1u8, e))?;
+        body["reasoning_effort"] = Value::String(mapped.to_string());
+    }
 
     let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
     let mut assistant_buf = String::new();
