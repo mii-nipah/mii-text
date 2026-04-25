@@ -40,9 +40,15 @@ format of the stateful file is the same as the input json, so you could even pip
 * `--reasoning <none|low|medium|high|xhigh>`
 specifies the reasoning level of the model, if it's not supported by the model it will be ignored.
 
-* `--stats`: prints some stats about the request after it's done (tokens, latency, etc)
+* `--stats`: prints some stats about the request after it's done (tokens, latency, etc) in stderr
 
 * `--cache <path>`: enables caching of the responses using a simple sqlite database to speed up repeated requests without requiring additional inferences
+
+* `--temperature <float>`: specifies the temperature to use for the generation
+
+* `--max-tokens <int>`: specifies the maximum number of tokens to generate (default: 128_000)
+
+* `--reasoning-summary`: enables 'auto' reasoning summary for models, which will be appended to the output within special `<think>` `</think>` tags independent of the provider, and will not be included in the stateful conversation history
 
 ## exit codes
 0. success
