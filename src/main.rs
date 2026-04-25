@@ -1,3 +1,285 @@
-fn main() {
-    println!("Hello, world!");
+use std::env;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use async_openai::Client;
+use async_openai::config::OpenAIConfig;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Default)]
+struct Args {
+    key: Option<String>,
+    url: Option<String>,
+    model: Option<String>,
+    stream: bool,
+    out: Option<PathBuf>,
+    system: Option<String>,
+    messages: Option<String>,
+    quick: bool,
+    stateful: Option<PathBuf>,
+}
+
+fn usage() -> &'static str {
+    "usage: mii-text [--key <s>] [--url <s>] [--model <s>] [--stream] [--out <path>]\n\
+                    [--system <s>] [--messages <json>] [--quick] [--stateful <path>]"
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut args = Args::default();
+    let mut it = env::args().skip(1);
+    fn need(
+        it: &mut std::iter::Skip<env::Args>,
+        flag: &str,
+    ) -> Result<String, String> {
+        it.next().ok_or_else(|| format!("missing value for {}", flag))
+    }
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--key" => args.key = Some(need(&mut it, "--key")?),
+            "--url" => args.url = Some(need(&mut it, "--url")?),
+            "--model" => args.model = Some(need(&mut it, "--model")?),
+            "--stream" => args.stream = true,
+            "--out" => args.out = Some(PathBuf::from(need(&mut it, "--out")?)),
+            "--system" => args.system = Some(need(&mut it, "--system")?),
+            "--messages" => args.messages = Some(need(&mut it, "--messages")?),
+            "--quick" => args.quick = true,
+            "--stateful" => args.stateful = Some(PathBuf::from(need(&mut it, "--stateful")?)),
+            "-h" | "--help" => {
+                println!("{}", usage());
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {}", other)),
+        }
+    }
+    Ok(args)
+}
+
+async fn read_stdin_to_string() -> std::io::Result<String> {
+    let mut buf = String::new();
+    tokio::io::stdin().read_to_string(&mut buf).await?;
+    Ok(buf)
+}
+
+async fn load_input_messages(args: &Args) -> Result<Vec<Message>, String> {
+    let raw = match &args.messages {
+        Some(s) => s.clone(),
+        None => read_stdin_to_string()
+            .await
+            .map_err(|e| format!("failed to read stdin: {}", e))?,
+    };
+
+    if args.quick {
+        let content = raw.trim().to_string();
+        if content.is_empty() {
+            return Err("quick mode requires non-empty input".to_string());
+        }
+        return Ok(vec![Message {
+            role: "user".to_string(),
+            content,
+        }]);
+    }
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("no input messages provided".to_string());
+    }
+    serde_json::from_str::<Vec<Message>>(trimmed)
+        .map_err(|e| format!("failed to parse messages json: {}", e))
+}
+
+async fn load_stateful(path: &PathBuf) -> Result<Vec<Message>, String> {
+    if !fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .await
+        .map_err(|e| format!("failed to read stateful file: {}", e))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<Message>>(trimmed)
+        .map_err(|e| format!("failed to parse stateful file json: {}", e))
+}
+
+async fn save_stateful(path: &PathBuf, msgs: &[Message]) -> Result<(), String> {
+    let serialized =
+        serde_json::to_string_pretty(msgs).map_err(|e| format!("serialize stateful: {}", e))?;
+    fs::write(path, serialized)
+        .await
+        .map_err(|e| format!("write stateful file: {}", e))
+}
+
+fn build_request_messages(system: &Option<String>, msgs: &[Message]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(msgs.len() + 1);
+    if let Some(sys) = system {
+        out.push(json!({ "role": "system", "content": sys }));
+    }
+    for m in msgs {
+        out.push(json!({ "role": m.role, "content": m.content }));
+    }
+    out
+}
+
+enum Sink {
+    Stdout(tokio::io::Stdout),
+    File(tokio::fs::File),
+}
+
+impl Sink {
+    async fn open(out: &Option<PathBuf>) -> Result<Self, String> {
+        match out {
+            Some(p) => {
+                let f = tokio::fs::File::create(p)
+                    .await
+                    .map_err(|e| format!("open output file: {}", e))?;
+                Ok(Sink::File(f))
+            }
+            None => Ok(Sink::Stdout(tokio::io::stdout())),
+        }
+    }
+
+    async fn write_str(&mut self, s: &str) -> std::io::Result<()> {
+        match self {
+            Sink::Stdout(o) => {
+                o.write_all(s.as_bytes()).await?;
+                o.flush().await
+            }
+            Sink::File(f) => f.write_all(s.as_bytes()).await,
+        }
+    }
+
+    async fn finish(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::Stdout(o) => o.flush().await,
+            Sink::File(f) => f.flush().await,
+        }
+    }
+}
+
+async fn run(args: Args) -> Result<u8, (u8, String)> {
+    let key = args
+        .key
+        .clone()
+        .or_else(|| env::var("OPENAI_API_KEY").ok())
+        .ok_or((1u8, "missing API key (--key or OPENAI_API_KEY)".to_string()))?;
+    let model = args
+        .model
+        .clone()
+        .or_else(|| env::var("OPENAI_MODEL_NAME").ok())
+        .ok_or((1u8, "missing model (--model or OPENAI_MODEL_NAME)".to_string()))?;
+    let base_url = args
+        .url
+        .clone()
+        .or_else(|| env::var("OPENAI_BASE_URL").ok());
+
+    let mut config = OpenAIConfig::new().with_api_key(key);
+    if let Some(u) = base_url {
+        config = config.with_api_base(u);
+    }
+    let client = Client::with_config(config);
+
+    let mut conversation: Vec<Message> = match &args.stateful {
+        Some(p) => load_stateful(p).await.map_err(|e| (1u8, e))?,
+        None => Vec::new(),
+    };
+
+    let new_messages = load_input_messages(&args).await.map_err(|e| (1u8, e))?;
+    conversation.extend(new_messages);
+
+    let req_messages = build_request_messages(&args.system, &conversation);
+    let body = json!({
+        "model": model,
+        "messages": req_messages,
+        "stream": args.stream,
+    });
+
+    let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
+    let mut assistant_buf = String::new();
+
+    if args.stream {
+        let mut stream = client
+            .chat()
+            .create_stream_byot::<Value, Value>(body)
+            .await
+            .map_err(|e| (2u8, format!("api error: {}", e)))?;
+
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| (2u8, format!("api stream error: {}", e)))?;
+            if let Some(delta) = chunk
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                if !delta.is_empty() {
+                    assistant_buf.push_str(delta);
+                    sink.write_str(delta)
+                        .await
+                        .map_err(|e| (1u8, format!("write output: {}", e)))?;
+                }
+            }
+        }
+    } else {
+        let resp: Value = client
+            .chat()
+            .create_byot(body)
+            .await
+            .map_err(|e| (2u8, format!("api error: {}", e)))?;
+        let content = resp
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        assistant_buf.push_str(content);
+        sink.write_str(content)
+            .await
+            .map_err(|e| (1u8, format!("write output: {}", e)))?;
+    }
+
+    sink.finish()
+        .await
+        .map_err(|e| (1u8, format!("flush output: {}", e)))?;
+
+    if let Some(p) = &args.stateful {
+        conversation.push(Message {
+            role: "assistant".to_string(),
+            content: assistant_buf,
+        });
+        save_stateful(p, &conversation).await.map_err(|e| (1u8, e))?;
+    }
+
+    Ok(0)
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{}\n{}", e, usage());
+            return ExitCode::from(1);
+        }
+    };
+
+    match run(args).await {
+        Ok(code) => ExitCode::from(code),
+        Err((code, msg)) => {
+            eprintln!("{}", msg);
+            ExitCode::from(code)
+        }
+    }
 }
