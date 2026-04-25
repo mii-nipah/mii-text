@@ -41,6 +41,7 @@ format of the stateful file is the same as the input json, so you could even pip
 specifies the reasoning level of the model, if it's not supported by the model it will be ignored.
 
 * `--stats`: prints some stats about the request after it's done (tokens, latency, etc) in stderr
+(if used with `--serve` it implies server logs will contain stats, not the clients)
 
 * `--cache <path>`: enables caching of the responses using a simple sqlite database to speed up repeated requests without requiring additional inferences
 

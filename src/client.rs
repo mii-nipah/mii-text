@@ -161,7 +161,10 @@ async fn connect(path: &PathBuf) -> Result<Stream, String> {
         .as_path()
         .to_fs_name::<GenericFilePath>()
         .map_err(|e| format!("invalid socket path: {}", e))?;
-    Stream::connect(name)
-        .await
-        .map_err(|e| format!("connect {}: {}", path.display(), e))
+    Stream::connect(name).await.map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
+            format!("connection {} unreachable (is `mii-text --serve` running?)", path.display())
+        }
+        _ => format!("connect {}: {}", path.display(), e),
+    })
 }

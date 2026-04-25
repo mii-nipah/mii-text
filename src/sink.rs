@@ -8,6 +8,14 @@ use tokio::sync::mpsc::UnboundedSender;
 pub enum ErrSink {
     Local,
     Channel(UnboundedSender<String>),
+    /// Server-side variant: forwards to the client only when the client
+    /// requested it, and always logs locally to stderr unless `quiet`.
+    Server {
+        tx: UnboundedSender<String>,
+        forward_to_client: bool,
+        quiet: bool,
+        conn_id: u64,
+    },
 }
 
 impl ErrSink {
@@ -18,6 +26,21 @@ impl ErrSink {
             }
             ErrSink::Channel(tx) => {
                 let _ = tx.send(s.to_string());
+            }
+            ErrSink::Server {
+                tx,
+                forward_to_client,
+                quiet,
+                conn_id,
+            } => {
+                if !*quiet {
+                    for line in s.lines() {
+                        eprintln!("#{} {}", conn_id, line);
+                    }
+                }
+                if *forward_to_client {
+                    let _ = tx.send(s.to_string());
+                }
             }
         }
     }

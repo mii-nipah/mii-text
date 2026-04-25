@@ -160,6 +160,7 @@ async fn handle_connection(
         max_tokens,
         reasoning_summary,
     };
+    let client_wants_stats = merged_client.stats;
 
     let mut effective: Args = clone_args(&server_args);
     // Cache and stateful are server-side-only / client-side-only respectively;
@@ -168,6 +169,10 @@ async fn handle_connection(
     effective.out = None;
     effective.stateful = None;
     effective.merge_client(merged_client);
+
+    // The server always computes stats so it can log them; whether they are
+    // also forwarded to the client depends on the client's --stats flag.
+    effective.stats = true;
 
     log!(
         quiet,
@@ -191,7 +196,12 @@ async fn handle_connection(
     // senders) are dropped before we drain remaining buffered messages.
     let outcome = {
         let mut sink = Sink::channel(text_tx);
-        let err_sink = ErrSink::Channel(err_tx);
+        let err_sink = ErrSink::Server {
+            tx: err_tx,
+            forward_to_client: client_wants_stats,
+            quiet,
+            conn_id: id,
+        };
         let mut run_fut = Box::pin(crate::run(&effective, &mut sink, &err_sink, stdin_override));
         loop {
             tokio::select! {
