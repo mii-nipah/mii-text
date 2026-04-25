@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -28,12 +29,13 @@ struct Args {
     quick: bool,
     stateful: Option<PathBuf>,
     reasoning: Option<String>,
+    stats: bool,
 }
 
 fn usage() -> &'static str {
     "usage: mii-text [--key <s>] [--url <s>] [--model <s>] [--stream] [--out <path>]\n\
                     [--system <s>] [--messages <json>] [--quick] [--stateful <path>]\n\
-                    [--reasoning <none|low|medium|high|xhigh>]"
+                    [--reasoning <none|low|medium|high|xhigh>] [--stats]"
 }
 
 fn map_reasoning(level: &str) -> Result<&'static str, String> {
@@ -71,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
             "--quick" => args.quick = true,
             "--stateful" => args.stateful = Some(PathBuf::from(need(&mut it, "--stateful")?)),
             "--reasoning" => args.reasoning = Some(need(&mut it, "--reasoning")?),
+            "--stats" => args.stats = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -224,9 +227,16 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
         let mapped = map_reasoning(level).map_err(|e| (1u8, e))?;
         body["reasoning_effort"] = Value::String(mapped.to_string());
     }
+    if args.stream && args.stats {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
 
     let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
     let mut assistant_buf = String::new();
+    let mut usage: Option<Value> = None;
+    let mut model_used: Option<String> = None;
+    let started = Instant::now();
+    let mut first_token_at: Option<std::time::Duration> = None;
 
     if args.stream {
         let mut stream = client
@@ -237,6 +247,16 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
 
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(|e| (2u8, format!("api stream error: {}", e)))?;
+            if model_used.is_none() {
+                if let Some(m) = chunk.get("model").and_then(|m| m.as_str()) {
+                    model_used = Some(m.to_string());
+                }
+            }
+            if let Some(u) = chunk.get("usage") {
+                if !u.is_null() {
+                    usage = Some(u.clone());
+                }
+            }
             if let Some(delta) = chunk
                 .get("choices")
                 .and_then(|c| c.get(0))
@@ -245,6 +265,9 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
                 .and_then(|c| c.as_str())
             {
                 if !delta.is_empty() {
+                    if first_token_at.is_none() {
+                        first_token_at = Some(started.elapsed());
+                    }
                     assistant_buf.push_str(delta);
                     sink.write_str(delta)
                         .await
@@ -258,6 +281,14 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
             .create_byot(body)
             .await
             .map_err(|e| (2u8, format!("api error: {}", e)))?;
+        if let Some(m) = resp.get("model").and_then(|m| m.as_str()) {
+            model_used = Some(m.to_string());
+        }
+        if let Some(u) = resp.get("usage") {
+            if !u.is_null() {
+                usage = Some(u.clone());
+            }
+        }
         let content = resp
             .get("choices")
             .and_then(|c| c.get(0))
@@ -271,9 +302,15 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
             .map_err(|e| (1u8, format!("write output: {}", e)))?;
     }
 
+    let total_elapsed = started.elapsed();
+
     sink.finish()
         .await
         .map_err(|e| (1u8, format!("flush output: {}", e)))?;
+
+    if args.stats {
+        print_stats(&model_used, &usage, total_elapsed, first_token_at);
+    }
 
     if let Some(p) = &args.stateful {
         conversation.push(Message {
@@ -284,6 +321,53 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
     }
 
     Ok(0)
+}
+
+fn print_stats(
+    model: &Option<String>,
+    usage: &Option<Value>,
+    total: std::time::Duration,
+    first_token: Option<std::time::Duration>,
+) {
+    eprintln!("\n--- stats ---");
+    if let Some(m) = model {
+        eprintln!("model: {}", m);
+    }
+    eprintln!("latency: {:.3}s", total.as_secs_f64());
+    if let Some(ft) = first_token {
+        eprintln!("time to first token: {:.3}s", ft.as_secs_f64());
+    }
+    match usage {
+        Some(u) => {
+            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
+            let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
+            let total_tok = u.get("total_tokens").and_then(|v| v.as_u64());
+            let reasoning = u
+                .get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64());
+            if let Some(p) = prompt {
+                eprintln!("prompt tokens: {}", p);
+            }
+            if let Some(c) = completion {
+                eprintln!("completion tokens: {}", c);
+            }
+            if let Some(r) = reasoning {
+                eprintln!("  reasoning tokens: {}", r);
+            }
+            if let Some(t) = total_tok {
+                eprintln!("total tokens: {}", t);
+            }
+            if let (Some(c), Some(secs)) = (completion, Some(total.as_secs_f64())) {
+                if secs > 0.0 {
+                    eprintln!("throughput: {:.1} tok/s", c as f64 / secs);
+                }
+            }
+        }
+        None => {
+            eprintln!("usage: <not reported by server>");
+        }
+    }
 }
 
 #[tokio::main]
