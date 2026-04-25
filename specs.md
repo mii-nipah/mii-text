@@ -40,6 +40,8 @@ format of the stateful file is the same as the input json, so you could even pip
 * `--reasoning <none|low|medium|high|xhigh>`
 specifies the reasoning level of the model, if it's not supported by the model it will be ignored.
 
+* `--stats`: prints some stats about the request after it's done (tokens, latency, etc)
+
 ## exit codes
 0. success
 1. invalid arguments (read stderr for details)
