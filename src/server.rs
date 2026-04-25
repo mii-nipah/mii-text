@@ -7,7 +7,7 @@ use interprocess::local_socket::ListenerOptions;
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::args::{Args, ClientArgs, default_ipc_socket};
@@ -194,6 +194,13 @@ async fn handle_connection(
     // and writes Frame::Stdout / Frame::Stderr to the socket. The sink and
     // error sink are scoped to this block so they (and thus the channel
     // senders) are dropped before we drain remaining buffered messages.
+    //
+    // We also poll the read half for EOF: if the client disconnects mid-
+    // generation (especially in the non-streaming case where no Frame writes
+    // happen until the provider returns), `fill_buf` resolves with an empty
+    // slice and we abort the in-flight request by dropping `run_fut`. This
+    // cancels the underlying reqwest call so we don't burn tokens for a
+    // client that's already gone.
     let outcome = {
         let mut sink = Sink::channel(text_tx);
         let err_sink = ErrSink::Server {
@@ -203,14 +210,36 @@ async fn handle_connection(
             conn_id: id,
         };
         let mut run_fut = Box::pin(crate::run(&effective, &mut sink, &err_sink, stdin_override));
+        let mut client_alive = true;
         loop {
             tokio::select! {
                 biased;
                 text = text_rx.recv() => if let Some(t) = text {
-                    write_json_line(&mut send, &Frame::Stdout { text: t }).await?;
+                    if write_json_line(&mut send, &Frame::Stdout { text: t }).await.is_err() {
+                        log!(quiet, "#{} client gone (write failed); cancelling generation", id);
+                        return Ok(());
+                    }
                 },
                 err = err_rx.recv() => if let Some(t) = err {
-                    write_json_line(&mut send, &Frame::Stderr { text: t }).await?;
+                    if write_json_line(&mut send, &Frame::Stderr { text: t }).await.is_err() {
+                        log!(quiet, "#{} client gone (write failed); cancelling generation", id);
+                        return Ok(());
+                    }
+                },
+                peek = reader.fill_buf(), if client_alive => match peek {
+                    Ok(buf) if buf.is_empty() => {
+                        log!(quiet, "#{} client disconnected; cancelling generation", id);
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        // Unexpected post-request bytes from the client; ignore
+                        // them but stop polling so we don't spin.
+                        client_alive = false;
+                    }
+                    Err(_) => {
+                        log!(quiet, "#{} client read error; cancelling generation", id);
+                        return Ok(());
+                    }
                 },
                 r = &mut run_fut => break r,
             }
