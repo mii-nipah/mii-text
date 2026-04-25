@@ -37,6 +37,9 @@ If no `--messages` flag is specified, it will consume from stdin instead.
 * `--stateful <path>`: the stateful illusion feature, allows you to specify a file to keep the state of the conversation, content of messages will be understood as a continuation (both in `--messages`|stdin multiple mode as json or with `--quick` as a next prompt)
 format of the stateful file is the same as the input json, so you could even pipe it back in a stateless manner if you wanted to
 
+* `--reasoning <none|low|medium|high|xhigh>`
+specifies the reasoning level of the model, if it's not supported by the model it will be ignored.
+
 ## exit codes
 0. success
 1. invalid arguments (read stderr for details)
