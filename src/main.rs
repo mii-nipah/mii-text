@@ -1,13 +1,15 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use futures::StreamExt;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -30,12 +32,13 @@ struct Args {
     stateful: Option<PathBuf>,
     reasoning: Option<String>,
     stats: bool,
+    cache: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
     "usage: mii-text [--key <s>] [--url <s>] [--model <s>] [--stream] [--out <path>]\n\
                     [--system <s>] [--messages <json>] [--quick] [--stateful <path>]\n\
-                    [--reasoning <none|low|medium|high|xhigh>] [--stats]"
+                    [--reasoning <none|low|medium|high|xhigh>] [--stats] [--cache <path>]"
 }
 
 fn map_reasoning(level: &str) -> Result<&'static str, String> {
@@ -74,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
             "--stateful" => args.stateful = Some(PathBuf::from(need(&mut it, "--stateful")?)),
             "--reasoning" => args.reasoning = Some(need(&mut it, "--reasoning")?),
             "--stats" => args.stats = true,
+            "--cache" => args.cache = Some(PathBuf::from(need(&mut it, "--cache")?)),
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -151,6 +155,103 @@ fn build_request_messages(system: &Option<String>, msgs: &[Message]) -> Vec<Valu
     out
 }
 
+/// Computes the cache key. Deliberately excludes secrets (api key) and
+/// transport-only fields (base URL, --stream, --out, --stateful, --stats)
+/// since they don't affect the model's output.
+fn cache_key(
+    model: &str,
+    system: &Option<String>,
+    messages: &[Message],
+    reasoning: &Option<String>,
+) -> String {
+    let canonical = json!({
+        "v": 1,
+        "model": model,
+        "system": system,
+        "messages": messages,
+        "reasoning": reasoning,
+    });
+    let serialized = serde_json::to_vec(&canonical).expect("canonical json");
+    let mut hasher = Sha256::new();
+    hasher.update(&serialized);
+    let bytes = hasher.finalize();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    hex
+}
+
+struct CachedEntry {
+    content: String,
+    usage: Option<Value>,
+    model: Option<String>,
+}
+
+fn cache_open(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create cache dir: {}", e))?;
+        }
+    }
+    let conn = Connection::open(path).map_err(|e| format!("open cache db: {}", e))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS responses (\n             key TEXT PRIMARY KEY,\n             content TEXT NOT NULL,\n             usage TEXT,\n             model TEXT,\n             created_at INTEGER NOT NULL\n         );",
+    )
+    .map_err(|e| format!("init cache schema: {}", e))?;
+    Ok(conn)
+}
+
+fn cache_lookup(conn: &Connection, key: &str) -> Result<Option<CachedEntry>, String> {
+    let row = conn
+        .query_row(
+            "SELECT content, usage, model FROM responses WHERE key = ?1",
+            params![key],
+            |r| {
+                let content: String = r.get(0)?;
+                let usage: Option<String> = r.get(1)?;
+                let model: Option<String> = r.get(2)?;
+                Ok((content, usage, model))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("cache lookup: {}", e))?;
+    match row {
+        None => Ok(None),
+        Some((content, usage_str, model)) => {
+            let usage = match usage_str {
+                Some(s) => serde_json::from_str(&s).ok(),
+                None => None,
+            };
+            Ok(Some(CachedEntry { content, usage, model }))
+        }
+    }
+}
+
+fn cache_store(
+    conn: &Connection,
+    key: &str,
+    content: &str,
+    usage: &Option<Value>,
+    model: &Option<String>,
+) -> Result<(), String> {
+    let usage_str = usage
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR REPLACE INTO responses (key, content, usage, model, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![key, content, usage_str, model, now],
+    )
+    .map_err(|e| format!("cache store: {}", e))?;
+    Ok(())
+}
+
 enum Sink {
     Stdout(tokio::io::Stdout),
     File(tokio::fs::File),
@@ -188,16 +289,64 @@ impl Sink {
 }
 
 async fn run(args: Args) -> Result<u8, (u8, String)> {
-    let key = args
-        .key
-        .clone()
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .ok_or((1u8, "missing API key (--key or OPENAI_API_KEY)".to_string()))?;
     let model = args
         .model
         .clone()
         .or_else(|| env::var("OPENAI_MODEL_NAME").ok())
         .ok_or((1u8, "missing model (--model or OPENAI_MODEL_NAME)".to_string()))?;
+
+    let mut conversation: Vec<Message> = match &args.stateful {
+        Some(p) => load_stateful(p).await.map_err(|e| (1u8, e))?,
+        None => Vec::new(),
+    };
+
+    let new_messages = load_input_messages(&args).await.map_err(|e| (1u8, e))?;
+    conversation.extend(new_messages);
+
+    let key_hash = cache_key(&model, &args.system, &conversation, &args.reasoning);
+    let cache_conn = match &args.cache {
+        Some(p) => Some(cache_open(p).map_err(|e| (1u8, e))?),
+        None => None,
+    };
+
+    // Try cache hit first (no API key required for hits).
+    if let Some(conn) = &cache_conn {
+        if let Some(hit) = cache_lookup(conn, &key_hash).map_err(|e| (1u8, e))? {
+            let started = Instant::now();
+            let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
+            sink.write_str(&hit.content)
+                .await
+                .map_err(|e| (1u8, format!("write output: {}", e)))?;
+            sink.finish()
+                .await
+                .map_err(|e| (1u8, format!("flush output: {}", e)))?;
+            if args.stats {
+                eprintln!("\n--- stats (cached) ---");
+                if let Some(m) = &hit.model {
+                    eprintln!("model: {}", m);
+                }
+                eprintln!("latency: {:.3}s", started.elapsed().as_secs_f64());
+                if let Some(u) = &hit.usage {
+                    print_usage_only(u);
+                }
+            }
+            if let Some(p) = &args.stateful {
+                conversation.push(Message {
+                    role: "assistant".to_string(),
+                    content: hit.content,
+                });
+                save_stateful(p, &conversation).await.map_err(|e| (1u8, e))?;
+            }
+            return Ok(0);
+        }
+    }
+
+    // Cache miss → real API call.
+    let key = args
+        .key
+        .clone()
+        .or_else(|| env::var("OPENAI_API_KEY").ok())
+        .ok_or((1u8, "missing API key (--key or OPENAI_API_KEY)".to_string()))?;
     let base_url = args
         .url
         .clone()
@@ -208,14 +357,6 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
         config = config.with_api_base(u);
     }
     let client = Client::with_config(config);
-
-    let mut conversation: Vec<Message> = match &args.stateful {
-        Some(p) => load_stateful(p).await.map_err(|e| (1u8, e))?,
-        None => Vec::new(),
-    };
-
-    let new_messages = load_input_messages(&args).await.map_err(|e| (1u8, e))?;
-    conversation.extend(new_messages);
 
     let req_messages = build_request_messages(&args.system, &conversation);
     let mut body = json!({
@@ -308,6 +449,11 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
         .await
         .map_err(|e| (1u8, format!("flush output: {}", e)))?;
 
+    if let Some(conn) = &cache_conn {
+        cache_store(conn, &key_hash, &assistant_buf, &usage, &model_used)
+            .map_err(|e| (1u8, e))?;
+    }
+
     if args.stats {
         print_stats(&model_used, &usage, total_elapsed, first_token_at);
     }
@@ -339,26 +485,10 @@ fn print_stats(
     }
     match usage {
         Some(u) => {
-            let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
+            print_usage_only(u);
             let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
-            let total_tok = u.get("total_tokens").and_then(|v| v.as_u64());
-            let reasoning = u
-                .get("completion_tokens_details")
-                .and_then(|d| d.get("reasoning_tokens"))
-                .and_then(|v| v.as_u64());
-            if let Some(p) = prompt {
-                eprintln!("prompt tokens: {}", p);
-            }
+            let secs = total.as_secs_f64();
             if let Some(c) = completion {
-                eprintln!("completion tokens: {}", c);
-            }
-            if let Some(r) = reasoning {
-                eprintln!("  reasoning tokens: {}", r);
-            }
-            if let Some(t) = total_tok {
-                eprintln!("total tokens: {}", t);
-            }
-            if let (Some(c), Some(secs)) = (completion, Some(total.as_secs_f64())) {
                 if secs > 0.0 {
                     eprintln!("throughput: {:.1} tok/s", c as f64 / secs);
                 }
@@ -367,6 +497,28 @@ fn print_stats(
         None => {
             eprintln!("usage: <not reported by server>");
         }
+    }
+}
+
+fn print_usage_only(u: &Value) {
+    let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
+    let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
+    let total_tok = u.get("total_tokens").and_then(|v| v.as_u64());
+    let reasoning = u
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64());
+    if let Some(p) = prompt {
+        eprintln!("prompt tokens: {}", p);
+    }
+    if let Some(c) = completion {
+        eprintln!("completion tokens: {}", c);
+    }
+    if let Some(r) = reasoning {
+        eprintln!("  reasoning tokens: {}", r);
+    }
+    if let Some(t) = total_tok {
+        eprintln!("total tokens: {}", t);
     }
 }
 
