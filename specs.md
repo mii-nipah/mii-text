@@ -50,6 +50,25 @@ specifies the reasoning level of the model, if it's not supported by the model i
 
 * `--reasoning-summary`: enables 'auto' reasoning summary for models, which will be appended to the output within special `<think>` `</think>` tags independent of the provider, and will not be included in the stateful conversation history
 
+## serve mode / client mode
+* `--serve`: starts a simple IPC server using the *interprocess* crate with some default configurations, so other processes can have an easier experience with mii-text without having to worry about the arguments or API keys
+in this mode it's required to have an url and api key (either by argument or env), the other arguments are all optional. If you provide an argument in the server and the "clients" don't it will use the server's argument as the default, otherwise client will dominate
+Example:
+```bash
+OPENAI_API_KEY=$OPENAI_KEY_THING mii-text --serve --model 'gpt-5.4-mini' --reasoning xhigh --cache /tmp/cache.db
+
+# in other terminal
+echo 'the capital of France is...' | mii-text --ipc --reasoning low --quick
+# will use the server arguments for model and cache, reasoning is overwritten and --quick mode is enabled
+```
+by default serve mode will emit logs related to actions being invoked. If you use the `--quiet` flag it will be silent instead.
+
+* `--ipc <path?>`: the client mode, by default will connect to the default UDS socket of the server, but you can specify a custom path optionally
+if `--ipc` is provided with `--serve`, it will act as the specifier of the socket path to use for the server instead of the default one
+
+Clients can also invoke:
+* `mii-text --ipc --status` to check if the server is alive and get some basic info about it (pid, uptime, etc).
+
 ## exit codes
 0. success
 1. invalid arguments (read stderr for details)

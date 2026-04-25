@@ -17,17 +17,22 @@ pub async fn read_stdin_to_string() -> std::io::Result<String> {
     Ok(buf)
 }
 
-/// Loads the user-supplied messages from `--messages` or stdin, applying
-/// `--quick` semantics if enabled.
+/// Loads the user-supplied messages from `--messages`, the provided stdin
+/// override, or actual stdin (in that order), applying `--quick` semantics if
+/// enabled.
 pub async fn load_input_messages(
     messages_arg: &Option<String>,
     quick: bool,
+    stdin_override: Option<&str>,
 ) -> Result<Vec<Message>, String> {
     let raw = match messages_arg {
         Some(s) => s.clone(),
-        None => read_stdin_to_string()
-            .await
-            .map_err(|e| format!("failed to read stdin: {}", e))?,
+        None => match stdin_override {
+            Some(s) => s.to_string(),
+            None => read_stdin_to_string()
+                .await
+                .map_err(|e| format!("failed to read stdin: {}", e))?,
+        },
     };
 
     if quick {

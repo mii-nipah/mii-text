@@ -8,13 +8,16 @@ use async_openai::config::OpenAIConfig;
 use crate::args::{Args, DEFAULT_MAX_TOKENS, parse, usage};
 use crate::conversation::{Message, load_input_messages, load_stateful, save_stateful};
 use crate::providers::{CallParams, call as call_provider};
-use crate::sink::Sink;
-use crate::stats::{print_stats, print_usage_only};
+use crate::sink::{ErrSink, Sink};
+use crate::stats::{format_cached_stats, format_stats};
 
 mod args;
 mod cache;
+mod client;
 mod conversation;
+mod ipc;
 mod providers;
+mod server;
 mod sink;
 mod stats;
 
@@ -27,7 +30,32 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match run(parsed).await {
+
+    if parsed.serve {
+        return match server::serve(parsed).await {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
+    if parsed.ipc {
+        let result = if parsed.status {
+            client::run_status(parsed).await
+        } else {
+            client::run_ipc(parsed).await
+        };
+        return match result {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    match run_local(parsed).await {
         Ok(code) => ExitCode::from(code),
         Err((code, msg)) => {
             eprintln!("{}", msg);
@@ -36,7 +64,29 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Args) -> Result<u8, (u8, String)> {
+async fn run_local(args: Args) -> Result<u8, (u8, String)> {
+    let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
+    let err = ErrSink::Local;
+    let outcome = run(&args, &mut sink, &err, None).await?;
+    Ok(outcome.exit_code)
+}
+
+pub struct RunOutcome {
+    pub exit_code: u8,
+    /// Final assistant message text (no `<think>` wrapping). Empty when no
+    /// content was produced.
+    pub assistant_buf: String,
+}
+
+/// Core request execution shared by local, server, and (via the server)
+/// IPC-client invocations. The caller owns sink lifecycle and decides how to
+/// surface diagnostic output.
+pub async fn run(
+    args: &Args,
+    sink: &mut Sink,
+    err: &ErrSink,
+    stdin_override: Option<String>,
+) -> Result<RunOutcome, (u8, String)> {
     let model = args
         .model
         .clone()
@@ -47,7 +97,7 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
         Some(p) => load_stateful(p).await.map_err(|e| (1u8, e))?,
         None => Vec::new(),
     };
-    let new_messages = load_input_messages(&args.messages, args.quick)
+    let new_messages = load_input_messages(&args.messages, args.quick, stdin_override.as_deref())
         .await
         .map_err(|e| (1u8, e))?;
     conversation.extend(new_messages);
@@ -69,7 +119,7 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
 
     if let Some(conn) = &cache_conn {
         if let Some(hit) = cache::lookup(conn, &key_hash).map_err(|e| (1u8, e))? {
-            return replay_cached(&args, &mut conversation, hit).await;
+            return replay_cached(args, sink, err, &mut conversation, hit).await;
         }
     }
 
@@ -89,11 +139,10 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
     }
     let client = Client::with_config(config);
 
-    let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
     let started = Instant::now();
     let outcome = call_provider(
         &client,
-        &mut sink,
+        sink,
         CallParams {
             model: &model,
             system: &args.system,
@@ -126,32 +175,36 @@ async fn run(args: Args) -> Result<u8, (u8, String)> {
     }
 
     if args.stats {
-        print_stats(
+        err.emit(&format_stats(
             &outcome.model_used,
             &outcome.usage,
             total_elapsed,
             outcome.first_token_at,
-        );
+        ));
     }
 
     if let Some(p) = &args.stateful {
         conversation.push(Message {
             role: "assistant".to_string(),
-            content: outcome.assistant_buf,
+            content: outcome.assistant_buf.clone(),
         });
         save_stateful(p, &conversation).await.map_err(|e| (1u8, e))?;
     }
 
-    Ok(0)
+    Ok(RunOutcome {
+        exit_code: 0,
+        assistant_buf: outcome.assistant_buf,
+    })
 }
 
 async fn replay_cached(
     args: &Args,
+    sink: &mut Sink,
+    err: &ErrSink,
     conversation: &mut Vec<Message>,
     hit: cache::CachedEntry,
-) -> Result<u8, (u8, String)> {
+) -> Result<RunOutcome, (u8, String)> {
     let started = Instant::now();
-    let mut sink = Sink::open(&args.out).await.map_err(|e| (1u8, e))?;
     sink.write_str(&hit.content)
         .await
         .map_err(|e| (1u8, format!("write output: {}", e)))?;
@@ -159,21 +212,17 @@ async fn replay_cached(
         .await
         .map_err(|e| (1u8, format!("flush output: {}", e)))?;
     if args.stats {
-        eprintln!("\n--- stats (cached) ---");
-        if let Some(m) = &hit.model {
-            eprintln!("model: {}", m);
-        }
-        eprintln!("latency: {:.3}s", started.elapsed().as_secs_f64());
-        if let Some(u) = &hit.usage {
-            print_usage_only(u);
-        }
+        err.emit(&format_cached_stats(&hit.model, &hit.usage, started.elapsed()));
     }
     if let Some(p) = &args.stateful {
         conversation.push(Message {
             role: "assistant".to_string(),
-            content: hit.content,
+            content: hit.content.clone(),
         });
         save_stateful(p, conversation).await.map_err(|e| (1u8, e))?;
     }
-    Ok(0)
+    Ok(RunOutcome {
+        exit_code: 0,
+        assistant_buf: hit.content,
+    })
 }

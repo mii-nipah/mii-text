@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use serde_json::{Value, json};
 
 /// Normalizes a Responses-API `usage` object into the Chat Completions shape
@@ -13,12 +15,13 @@ pub fn normalize_responses_usage(u: &Value) -> Value {
         .get("output_tokens")
         .or_else(|| u.get("completion_tokens"))
         .and_then(|v| v.as_u64());
-    let total = u.get("total_tokens").and_then(|v| v.as_u64()).or_else(|| {
-        match (prompt, completion) {
+    let total = u
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| match (prompt, completion) {
             (Some(p), Some(c)) => Some(p + c),
             _ => None,
-        }
-    });
+        });
     let reasoning = u
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -48,38 +51,57 @@ pub fn normalize_responses_usage(u: &Value) -> Value {
     Value::Object(out)
 }
 
-pub fn print_stats(
+pub fn format_stats(
     model: &Option<String>,
     usage: &Option<Value>,
     total: std::time::Duration,
     first_token: Option<std::time::Duration>,
-) {
-    eprintln!("\n--- stats ---");
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n--- stats ---");
     if let Some(m) = model {
-        eprintln!("model: {}", m);
+        let _ = writeln!(out, "model: {}", m);
     }
-    eprintln!("latency: {:.3}s", total.as_secs_f64());
+    let _ = writeln!(out, "latency: {:.3}s", total.as_secs_f64());
     if let Some(ft) = first_token {
-        eprintln!("time to first token: {:.3}s", ft.as_secs_f64());
+        let _ = writeln!(out, "time to first token: {:.3}s", ft.as_secs_f64());
     }
     match usage {
         Some(u) => {
-            print_usage_only(u);
+            push_usage(&mut out, u);
             let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
             let secs = total.as_secs_f64();
             if let Some(c) = completion {
                 if secs > 0.0 {
-                    eprintln!("throughput: {:.1} tok/s", c as f64 / secs);
+                    let _ = writeln!(out, "throughput: {:.1} tok/s", c as f64 / secs);
                 }
             }
         }
         None => {
-            eprintln!("usage: <not reported by server>");
+            let _ = writeln!(out, "usage: <not reported by server>");
         }
     }
+    out
 }
 
-pub fn print_usage_only(u: &Value) {
+pub fn format_cached_stats(
+    model: &Option<String>,
+    usage: &Option<Value>,
+    total: std::time::Duration,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "\n--- stats (cached) ---");
+    if let Some(m) = model {
+        let _ = writeln!(out, "model: {}", m);
+    }
+    let _ = writeln!(out, "latency: {:.3}s", total.as_secs_f64());
+    if let Some(u) = usage {
+        push_usage(&mut out, u);
+    }
+    out
+}
+
+fn push_usage(out: &mut String, u: &Value) {
     let prompt = u.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
     let total_tok = u.get("total_tokens").and_then(|v| v.as_u64());
@@ -88,15 +110,15 @@ pub fn print_usage_only(u: &Value) {
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(|v| v.as_u64());
     if let Some(p) = prompt {
-        eprintln!("prompt tokens: {}", p);
+        let _ = writeln!(out, "prompt tokens: {}", p);
     }
     if let Some(c) = completion {
-        eprintln!("completion tokens: {}", c);
+        let _ = writeln!(out, "completion tokens: {}", c);
     }
     if let Some(r) = reasoning {
-        eprintln!("  reasoning tokens: {}", r);
+        let _ = writeln!(out, "  reasoning tokens: {}", r);
     }
     if let Some(t) = total_tok {
-        eprintln!("total tokens: {}", t);
+        let _ = writeln!(out, "total tokens: {}", t);
     }
 }

@@ -1,10 +1,34 @@
 use std::path::PathBuf;
 
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::UnboundedSender;
+
+/// Sink for diagnostic / stats text. Either eprint!-equivalent or a channel
+/// that buffers lines for forwarding to a connected IPC client.
+pub enum ErrSink {
+    Local,
+    Channel(UnboundedSender<String>),
+}
+
+impl ErrSink {
+    pub fn emit(&self, s: &str) {
+        match self {
+            ErrSink::Local => {
+                eprint!("{}", s);
+            }
+            ErrSink::Channel(tx) => {
+                let _ = tx.send(s.to_string());
+            }
+        }
+    }
+}
 
 pub enum Sink {
     Stdout(tokio::io::Stdout),
     File(tokio::fs::File),
+    /// Sends each write as a separate string into a channel. Used by the
+    /// `--serve` mode to forward streamed text frames to a connected client.
+    Channel(UnboundedSender<String>),
 }
 
 impl Sink {
@@ -20,6 +44,10 @@ impl Sink {
         }
     }
 
+    pub fn channel(tx: UnboundedSender<String>) -> Self {
+        Sink::Channel(tx)
+    }
+
     pub async fn write_str(&mut self, s: &str) -> std::io::Result<()> {
         match self {
             Sink::Stdout(o) => {
@@ -27,6 +55,14 @@ impl Sink {
                 o.flush().await
             }
             Sink::File(f) => f.write_all(s.as_bytes()).await,
+            Sink::Channel(tx) => {
+                tx.send(s.to_string()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "ipc client disconnected",
+                    )
+                })
+            }
         }
     }
 
@@ -34,6 +70,7 @@ impl Sink {
         match self {
             Sink::Stdout(o) => o.flush().await,
             Sink::File(f) => f.flush().await,
+            Sink::Channel(_) => Ok(()),
         }
     }
 }
