@@ -67,6 +67,8 @@ export OPENAI_MODEL_NAME=gpt-5-mini
 echo 'write a haiku about cargo' | mii-text --quick
 ```
 
+For custom OpenAI-compatible endpoints, such as local model servers, `--key` / `OPENAI_API_KEY` is optional unless that endpoint requires one.
+
 Pass an explicit message list instead of stdin:
 
 ```bash
@@ -251,7 +253,7 @@ Override semantics:
 | `OPENAI_MODEL_NAME` | `--model`       |
 | `XDG_RUNTIME_DIR`   | IPC socket dir  |
 
-`--url` makes mii-text usable with any OpenAI-compatible endpoint (local llama.cpp servers, OpenRouter, Groq, etc.).
+`--url` makes mii-text usable with any OpenAI-compatible endpoint (local llama.cpp servers, OpenRouter, Groq, etc.). API keys are required for OpenAI's default endpoint, but optional for custom URLs so local servers can run without fake secrets.
 
 ## Exit codes
 

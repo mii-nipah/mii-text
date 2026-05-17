@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::args::{Args, ClientArgs, default_ipc_socket};
 use crate::ipc::{Frame, Request, StatusInfo, read_json_line, write_json_line};
+use crate::providers::is_openai;
 use crate::sink::{ErrSink, Sink};
 
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -37,8 +38,18 @@ macro_rules! log {
 }
 
 pub async fn serve(server_args: Args) -> Result<(), String> {
-    if server_args.key.is_none() && std::env::var("OPENAI_API_KEY").is_err() {
-        return Err("--serve requires an API key (--key or OPENAI_API_KEY)".to_string());
+    let base_url = server_args
+        .url
+        .clone()
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
+    if serve_requires_key(
+        base_url.as_deref(),
+        server_args.key.as_deref(),
+        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+    ) {
+        return Err(
+            "--serve requires an API key (--key or OPENAI_API_KEY) for OpenAI URLs".to_string(),
+        );
     }
     let socket_path: PathBuf = server_args
         .ipc_path
@@ -81,6 +92,18 @@ pub async fn serve(server_args: Args) -> Result<(), String> {
             }
         });
     }
+}
+
+fn serve_requires_key(
+    base_url: Option<&str>,
+    explicit_key: Option<&str>,
+    env_key: Option<&str>,
+) -> bool {
+    let has_key = explicit_key
+        .or(env_key)
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false);
+    is_openai(base_url) && !has_key
 }
 
 async fn handle_connection(
@@ -393,5 +416,22 @@ mod tests {
         assert_eq!(cloned.ipc_path, None);
         assert!(!cloned.status);
         assert!(cloned.quiet);
+    }
+
+    #[test]
+    fn serve_requires_key_only_for_openai_urls() {
+        assert!(serve_requires_key(None, None, None));
+        assert!(serve_requires_key(
+            Some("https://api.openai.com/v1"),
+            None,
+            None
+        ));
+        assert!(!serve_requires_key(
+            Some("http://localhost:8080/v1"),
+            None,
+            None
+        ));
+        assert!(!serve_requires_key(None, Some("sk-explicit"), None));
+        assert!(!serve_requires_key(None, None, Some("sk-env")));
     }
 }

@@ -6,7 +6,7 @@ It's completely stateless in principle, so the user may invoke it without worrie
 A semi-stateful API exists as a convenient "illusion" so users can have a continuous experience with it if.
 
 * `--key <string>`: specifies your API key
-You can also pass OPENAI_API_KEY as an env var to the process.
+You can also pass OPENAI_API_KEY as an env var to the process. Required for OpenAI's default API, optional for custom `--url` endpoints that do not require authentication.
 
 * `--url <string>`: specifies the base URL of your API
 (optional if you want to use openai models directly)
@@ -68,7 +68,7 @@ OpenAI Responses requests are stateless (`store: false`) and always request `rea
 
 ## serve mode / client mode
 * `--serve`: starts a simple IPC server using the *interprocess* crate with some default configurations, so other processes can have an easier experience with mii-text without having to worry about the arguments or API keys
-in this mode it's required to have an url and api key (either by argument or env), the other arguments are all optional. If you provide an argument in the server and the "clients" don't it will use the server's argument as the default, otherwise client will dominate
+in this mode OpenAI URLs require an api key (either by argument or env), while custom urls may run without one. The other arguments are all optional. If you provide an argument in the server and the "clients" don't it will use the server's argument as the default, otherwise client will dominate
 Example:
 ```bash
 OPENAI_API_KEY=$OPENAI_KEY_THING mii-text --serve --model 'gpt-5.4-mini' --reasoning xhigh --cache /tmp/cache.db

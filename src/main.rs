@@ -11,7 +11,7 @@ use crate::conversation::{
 };
 use crate::output::ProviderContinuation;
 use crate::output::render_cached;
-use crate::providers::{CallParams, call as call_provider, should_include_reasoning};
+use crate::providers::{CallParams, call as call_provider, is_openai, should_include_reasoning};
 use crate::sink::{ErrSink, Sink};
 use crate::stats::{format_cached_stats, format_stats};
 
@@ -135,15 +135,19 @@ pub async fn run(
         return replay_cached(args, sink, err, &mut conversation, hit).await;
     }
 
-    let api_key = args
-        .key
-        .clone()
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .ok_or((1u8, "missing API key (--key or OPENAI_API_KEY)".to_string()))?;
     let base_url = args
         .url
         .clone()
         .or_else(|| env::var("OPENAI_BASE_URL").ok());
+    let api_key = api_key_for_base_url(
+        args.key.clone().and_then(non_empty).as_deref(),
+        env::var("OPENAI_API_KEY")
+            .ok()
+            .and_then(non_empty)
+            .as_deref(),
+        base_url.as_deref(),
+    )
+    .map_err(|e| (1u8, e))?;
 
     let mut config = OpenAIConfig::new().with_api_key(api_key);
     if let Some(u) = &base_url {
@@ -272,4 +276,62 @@ async fn replay_cached(
         assistant_buf: assistant,
         provider_continuation: continuation,
     })
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn api_key_for_base_url(
+    explicit_key: Option<&str>,
+    env_key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<String, String> {
+    if let Some(key) = explicit_key.or(env_key) {
+        return Ok(key.to_string());
+    }
+    if !is_openai(base_url) {
+        return Ok("mii-text-local".to_string());
+    }
+    Err("missing API key (--key or OPENAI_API_KEY)".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_is_required_for_openai_base_urls() {
+        assert!(api_key_for_base_url(None, None, None).is_err());
+        assert!(api_key_for_base_url(None, None, Some("https://api.openai.com/v1")).is_err());
+        assert_eq!(
+            api_key_for_base_url(Some("sk-explicit"), None, None).unwrap(),
+            "sk-explicit"
+        );
+        assert_eq!(
+            api_key_for_base_url(None, Some("sk-env"), None).unwrap(),
+            "sk-env"
+        );
+    }
+
+    #[test]
+    fn custom_base_urls_can_run_without_a_key() {
+        assert_eq!(
+            api_key_for_base_url(None, None, Some("http://localhost:8080/v1")).unwrap(),
+            "mii-text-local"
+        );
+        assert_eq!(
+            api_key_for_base_url(
+                None,
+                Some("real-local-key"),
+                Some("http://localhost:8080/v1")
+            )
+            .unwrap(),
+            "real-local-key"
+        );
+    }
 }
