@@ -64,7 +64,7 @@ Tool definitions are sent to the provider's `tools` request field. Function tool
 
 If the model returns tool calls instead of text, mii-text writes them in the `tool_calls` output field. In `--simple` mode it writes the tool-call json array to stdout. It does not execute tools itself.
 
-OpenAI Responses requests are stateless (`store: false`) and always request `reasoning.encrypted_content`. When OpenAI returns encrypted reasoning items, mii-text exposes them as `provider_continuation`; users can include the `provider_continuation` object, or the streamed `{"type":"provider_continuation","provider":"openai","reasoning_items":[...]}` event shape, in later `--messages` arrays to round-trip those opaque items back into Responses input.
+OpenAI Responses requests are stateless (`store: false`) and always request `reasoning.encrypted_content`. When OpenAI returns encrypted reasoning items, mii-text exposes them as `provider_continuation`; users can include the `provider_continuation` object, or the streamed `{"type":"provider_continuation","provider":"openai","reasoning_items":[...]}` event shape, in later `--messages` arrays to round-trip those opaque items back into Responses input. Chat Completions-compatible providers ignore these provider-private continuation items.
 
 ## serve mode / client mode
 * `--serve`: starts a simple IPC server using the *interprocess* crate with some default configurations, so other processes can have an easier experience with mii-text without having to worry about the arguments or API keys

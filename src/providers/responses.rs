@@ -6,6 +6,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::args::map_reasoning;
+use crate::conversation::is_provider_continuation_value;
 use crate::output::{OutputWriter, ProviderContinuation};
 use crate::sink::Sink;
 use crate::stats::normalize_responses_usage;
@@ -28,7 +29,7 @@ fn build_input(
 }
 
 fn append_input_item(out: &mut Vec<Value>, item: Value) -> Result<(), String> {
-    if !is_provider_continuation_wrapper(&item) {
+    if !is_provider_continuation_value(&item) {
         out.push(item);
         return Ok(());
     }
@@ -51,16 +52,6 @@ fn append_input_item(out: &mut Vec<Value>, item: Value) -> Result<(), String> {
         .ok_or_else(|| "provider_continuation requires a reasoning_items array".to_string())?;
     out.extend(reasoning_items.iter().cloned());
     Ok(())
-}
-
-fn is_provider_continuation_wrapper(item: &Value) -> bool {
-    if item.get("type").and_then(Value::as_str) == Some("provider_continuation") {
-        return true;
-    }
-    item.get("role").is_none()
-        && item.get("content").is_none()
-        && item.get("provider").is_some()
-        && item.get("reasoning_items").is_some()
 }
 
 pub async fn call(

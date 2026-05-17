@@ -132,9 +132,22 @@ pub fn build_chat_messages(system: &Option<String>, msgs: &[Message]) -> Vec<Val
         out.push(json!({ "role": "system", "content": sys }));
     }
     for m in msgs {
-        out.push(m.to_api_value());
+        let value = m.to_api_value();
+        if !is_provider_continuation_value(&value) {
+            out.push(value);
+        }
     }
     out
+}
+
+pub fn is_provider_continuation_value(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) == Some("provider_continuation") {
+        return true;
+    }
+    item.get("role").is_none()
+        && item.get("content").is_none()
+        && item.get("provider").is_some()
+        && item.get("reasoning_items").is_some()
 }
 
 #[cfg(test)]
@@ -287,5 +300,30 @@ mod tests {
         assert_eq!(api[1]["tool_calls"][0]["id"], "call_1");
         assert_eq!(api[2]["tool_call_id"], "call_1");
         assert_eq!(api[2]["content"], "ok");
+    }
+
+    #[test]
+    fn build_chat_messages_drops_provider_continuation_items() {
+        let messages = serde_json::from_str::<Vec<Message>>(
+            r#"[
+                {
+                    "provider":"openai",
+                    "response_id":"resp_1",
+                    "reasoning_items":[
+                        {
+                            "type":"reasoning",
+                            "encrypted_content":"opaque"
+                        }
+                    ]
+                },
+                {"role":"user","content":"hello"}
+            ]"#,
+        )
+        .unwrap();
+
+        let api = build_chat_messages(&None, &messages);
+
+        assert_eq!(api.len(), 1);
+        assert_eq!(api[0], json!({ "role": "user", "content": "hello" }));
     }
 }

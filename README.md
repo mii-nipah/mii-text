@@ -196,7 +196,7 @@ For OpenAI Responses requests, mii-text sends `store: false` and `include: ["rea
 }
 ```
 
-To continue a stateless Responses conversation, include that object as an item in your next `--messages` array. mii-text also accepts the streamed event shape with `"type": "provider_continuation"`, and expands `reasoning_items` into the OpenAI `input` array before sending the request.
+To continue a stateless Responses conversation, include that object as an item in your next `--messages` array. mii-text also accepts the streamed event shape with `"type": "provider_continuation"`, and expands `reasoning_items` into the OpenAI `input` array before sending the request. Chat Completions-compatible providers, including local `--url` backends, ignore these provider-private continuation items.
 
 ### Stateful conversations
 
