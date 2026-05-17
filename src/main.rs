@@ -7,7 +7,8 @@ use async_openai::config::OpenAIConfig;
 
 use crate::args::{Args, DEFAULT_MAX_TOKENS, parse, usage};
 use crate::conversation::{Message, load_input_messages, load_stateful, save_stateful};
-use crate::providers::{CallParams, call as call_provider};
+use crate::output::render_cached;
+use crate::providers::{CallParams, call as call_provider, should_include_reasoning};
 use crate::sink::{ErrSink, Sink};
 use crate::stats::{format_cached_stats, format_stats};
 
@@ -16,10 +17,12 @@ mod cache;
 mod client;
 mod conversation;
 mod ipc;
+mod output;
 mod providers;
 mod server;
 mod sink;
 mod stats;
+mod tools;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -91,7 +94,10 @@ pub async fn run(
         .model
         .clone()
         .or_else(|| env::var("OPENAI_MODEL_NAME").ok())
-        .ok_or((1u8, "missing model (--model or OPENAI_MODEL_NAME)".to_string()))?;
+        .ok_or((
+            1u8,
+            "missing model (--model or OPENAI_MODEL_NAME)".to_string(),
+        ))?;
 
     let mut conversation: Vec<Message> = match &args.stateful {
         Some(p) => load_stateful(p).await.map_err(|e| (1u8, e))?,
@@ -103,24 +109,26 @@ pub async fn run(
     conversation.extend(new_messages);
 
     let max_tokens = args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let key_hash = cache::key(
-        &model,
-        &args.system,
-        &conversation,
-        &args.reasoning,
-        args.temperature,
+    let tools = tools::resolve(&args.tools).await.map_err(|e| (1u8, e))?;
+    let key_hash = cache::key(cache::KeyParts {
+        model: &model,
+        system: &args.system,
+        messages: &conversation,
+        reasoning: &args.reasoning,
+        temperature: args.temperature,
         max_tokens,
-        args.reasoning_summary,
-    );
+        tools: &tools,
+        completions: args.completions,
+    });
     let cache_conn = match &args.cache {
         Some(p) => Some(cache::open(p).map_err(|e| (1u8, e))?),
         None => None,
     };
 
-    if let Some(conn) = &cache_conn {
-        if let Some(hit) = cache::lookup(conn, &key_hash).map_err(|e| (1u8, e))? {
-            return replay_cached(args, sink, err, &mut conversation, hit).await;
-        }
+    if let Some(conn) = &cache_conn
+        && let Some(hit) = cache::lookup(conn, &key_hash).map_err(|e| (1u8, e))?
+    {
+        return replay_cached(args, sink, err, &mut conversation, hit).await;
     }
 
     let api_key = args
@@ -153,6 +161,9 @@ pub async fn run(
             max_tokens,
             reasoning_summary: args.reasoning_summary,
             stats: args.stats,
+            tools: &tools,
+            completions: args.completions,
+            simple: args.simple,
         },
         base_url.as_deref(),
     )
@@ -168,6 +179,8 @@ pub async fn run(
             conn,
             &key_hash,
             &outcome.full_output,
+            &outcome.assistant_buf,
+            &outcome.prospect,
             &outcome.usage,
             &outcome.model_used,
         )
@@ -184,11 +197,10 @@ pub async fn run(
     }
 
     if let Some(p) = &args.stateful {
-        conversation.push(Message {
-            role: "assistant".to_string(),
-            content: outcome.assistant_buf.clone(),
-        });
-        save_stateful(p, &conversation).await.map_err(|e| (1u8, e))?;
+        conversation.push(Message::assistant(outcome.assistant_buf.clone()));
+        save_stateful(p, &conversation)
+            .await
+            .map_err(|e| (1u8, e))?;
     }
 
     Ok(RunOutcome {
@@ -205,24 +217,42 @@ async fn replay_cached(
     hit: cache::CachedEntry,
 ) -> Result<RunOutcome, (u8, String)> {
     let started = Instant::now();
-    sink.write_str(&hit.content)
+    let (rendered, assistant) = match hit.prospect {
+        Some(prospect) => {
+            let rendered = render_cached(
+                &prospect,
+                args.simple,
+                args.stream,
+                should_include_reasoning(args.reasoning_summary, args.stream, args.simple),
+            )
+            .map_err(|e| (1u8, e))?;
+            let assistant = prospect.content.clone();
+            (rendered, assistant)
+        }
+        None => {
+            let assistant = hit.assistant.unwrap_or_else(|| hit.content.clone());
+            (hit.content, assistant)
+        }
+    };
+    sink.write_str(&rendered)
         .await
         .map_err(|e| (1u8, format!("write output: {}", e)))?;
     sink.finish()
         .await
         .map_err(|e| (1u8, format!("flush output: {}", e)))?;
     if args.stats {
-        err.emit(&format_cached_stats(&hit.model, &hit.usage, started.elapsed()));
+        err.emit(&format_cached_stats(
+            &hit.model,
+            &hit.usage,
+            started.elapsed(),
+        ));
     }
     if let Some(p) = &args.stateful {
-        conversation.push(Message {
-            role: "assistant".to_string(),
-            content: hit.content.clone(),
-        });
+        conversation.push(Message::assistant(assistant.clone()));
         save_stateful(p, conversation).await.map_err(|e| (1u8, e))?;
     }
     Ok(RunOutcome {
         exit_code: 0,
-        assistant_buf: hit.content,
+        assistant_buf: assistant,
     })
 }

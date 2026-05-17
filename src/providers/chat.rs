@@ -7,9 +7,11 @@ use serde_json::{Value, json};
 
 use crate::args::map_reasoning;
 use crate::conversation::build_chat_messages;
-use crate::sink::{Sink, ThinkWriter};
+use crate::output::OutputWriter;
+use crate::sink::Sink;
+use crate::tools;
 
-use super::{CallOutcome, CallParams};
+use super::{CallOutcome, CallParams, should_include_reasoning};
 
 pub async fn call(
     client: &Client<OpenAIConfig>,
@@ -29,6 +31,9 @@ pub async fn call(
     if let Some(t) = params.temperature {
         body["temperature"] = json!(t);
     }
+    if let Some(tool_defs) = params.tools {
+        body["tools"] = Value::Array(tools::for_chat(tool_defs));
+    }
     body["max_completion_tokens"] = json!(params.max_tokens);
     // Note: `--reasoning-summary` doesn't add a request field for chat
     // completions. OpenAI only emits reasoning text via the Responses API,
@@ -38,13 +43,15 @@ pub async fn call(
         body["stream_options"] = json!({ "include_usage": true });
     }
 
-    let mut assistant_buf = String::new();
     let mut full_output = String::new();
+    let emit_reasoning =
+        should_include_reasoning(params.reasoning_summary, params.stream, params.simple);
+    let mut output = OutputWriter::with_reasoning(params.simple, params.stream, emit_reasoning);
+    let mut tool_calls: Vec<Value> = Vec::new();
     let mut usage: Option<Value> = None;
     let mut model_used: Option<String> = None;
     let started = Instant::now();
     let mut first_token_at = None;
-    let mut think = ThinkWriter::new(params.reasoning_summary);
 
     if params.stream {
         let mut stream = client
@@ -55,57 +62,62 @@ pub async fn call(
 
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(|e| (2u8, format!("api stream error: {}", e)))?;
-            if model_used.is_none() {
-                if let Some(m) = chunk.get("model").and_then(|m| m.as_str()) {
-                    model_used = Some(m.to_string());
-                }
+            if model_used.is_none()
+                && let Some(m) = chunk.get("model").and_then(|m| m.as_str())
+            {
+                model_used = Some(m.to_string());
             }
-            if let Some(u) = chunk.get("usage") {
-                if !u.is_null() {
-                    usage = Some(u.clone());
-                }
+            if let Some(u) = chunk.get("usage")
+                && !u.is_null()
+            {
+                usage = Some(u.clone());
             }
             let delta = chunk
                 .get("choices")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("delta"));
 
-            if params.reasoning_summary {
-                if let Some(d) = delta {
-                    let r = d
-                        .get("reasoning_content")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| d.get("reasoning").and_then(|v| v.as_str()));
-                    if let Some(r) = r {
-                        let opened = think
-                            .write_reasoning(sink, &mut full_output, r)
-                            .await
-                            .map_err(|e| (1u8, e))?;
-                        if opened && first_token_at.is_none() {
-                            first_token_at = Some(started.elapsed());
-                        }
+            if let Some(d) = delta {
+                let r = d
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| d.get("reasoning").and_then(|v| v.as_str()));
+                if let Some(r) = r {
+                    let wrote = output
+                        .push_reasoning(sink, &mut full_output, r)
+                        .await
+                        .map_err(|e| (1u8, e))?;
+                    if wrote && first_token_at.is_none() {
+                        first_token_at = Some(started.elapsed());
                     }
                 }
+            }
+            if let Some(d) = delta {
+                if d.get("tool_calls").and_then(Value::as_array).is_some()
+                    && first_token_at.is_none()
+                {
+                    first_token_at = Some(started.elapsed());
+                }
+                merge_tool_call_deltas(&mut tool_calls, d);
             }
 
             if let Some(content) = delta
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
+                && !content.is_empty()
             {
-                if !content.is_empty() {
-                    if first_token_at.is_none() {
-                        first_token_at = Some(started.elapsed());
-                    }
-                    think
-                        .write_content(sink, &mut full_output, content)
-                        .await
-                        .map_err(|e| (1u8, e))?;
-                    assistant_buf.push_str(content);
+                if first_token_at.is_none() {
+                    first_token_at = Some(started.elapsed());
                 }
+                output
+                    .push_content(sink, &mut full_output, content)
+                    .await
+                    .map_err(|e| (1u8, e))?;
             }
         }
-        think
-            .close_if_open(sink, &mut full_output)
+        output.set_tool_calls(tool_calls);
+        output
+            .finish(sink, &mut full_output)
             .await
             .map_err(|e| (1u8, e))?;
     } else {
@@ -117,44 +129,188 @@ pub async fn call(
         if let Some(m) = resp.get("model").and_then(|m| m.as_str()) {
             model_used = Some(m.to_string());
         }
-        if let Some(u) = resp.get("usage") {
-            if !u.is_null() {
-                usage = Some(u.clone());
-            }
+        if let Some(u) = resp.get("usage")
+            && !u.is_null()
+        {
+            usage = Some(u.clone());
         }
         let message = resp
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"));
-        if params.reasoning_summary {
-            let reasoning_text = message.and_then(|m| {
-                m.get("reasoning_content")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| m.get("reasoning").and_then(|v| v.as_str()))
-            });
-            if let Some(r) = reasoning_text {
-                think
-                    .write_reasoning(sink, &mut full_output, r)
-                    .await
-                    .map_err(|e| (1u8, e))?;
-            }
+        if let Some(calls) = message
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            tool_calls = calls.clone();
+        }
+        let reasoning_text = message.and_then(|m| {
+            m.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .or_else(|| m.get("reasoning").and_then(|v| v.as_str()))
+        });
+        if let Some(r) = reasoning_text {
+            output
+                .push_reasoning(sink, &mut full_output, r)
+                .await
+                .map_err(|e| (1u8, e))?;
         }
         let content = message
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        think
-            .write_content(sink, &mut full_output, content)
+        output
+            .push_content(sink, &mut full_output, content)
             .await
             .map_err(|e| (1u8, e))?;
-        assistant_buf.push_str(content);
+        output.set_tool_calls(tool_calls);
+        output
+            .finish(sink, &mut full_output)
+            .await
+            .map_err(|e| (1u8, e))?;
     }
+    let prospect = output.prospect().clone();
+    let assistant_buf = prospect.content.clone();
 
     Ok(CallOutcome {
         assistant_buf,
         full_output,
+        prospect,
         usage,
         model_used,
         first_token_at,
     })
+}
+
+fn merge_tool_call_deltas(tool_calls: &mut Vec<Value>, delta: &Value) {
+    let Some(items) = delta.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+
+    for item in items {
+        let index = item
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|i| i as usize)
+            .unwrap_or(tool_calls.len());
+        while tool_calls.len() <= index {
+            tool_calls.push(json!({}));
+        }
+        merge_delta_value(&mut tool_calls[index], item);
+    }
+}
+
+fn merge_delta_value(target: &mut Value, delta: &Value) {
+    if !target.is_object() || !delta.is_object() {
+        *target = delta.clone();
+        return;
+    }
+
+    let target = target.as_object_mut().expect("checked object");
+    let delta = delta.as_object().expect("checked object");
+    for (key, value) in delta {
+        if key == "index" || value.is_null() {
+            continue;
+        }
+
+        match (target.get_mut(key), value) {
+            (Some(Value::String(existing)), Value::String(part))
+                if key == "arguments" || key == "input" =>
+            {
+                existing.push_str(part)
+            }
+            (Some(existing @ Value::Object(_)), Value::Object(_)) => {
+                merge_delta_value(existing, value);
+            }
+            (Some(Value::String(existing)), Value::String(part)) => {
+                if existing.is_empty() {
+                    existing.push_str(part);
+                } else if existing != part {
+                    *existing = part.clone();
+                }
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn merges_streamed_tool_call_deltas() {
+        let mut calls = Vec::new();
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "search", "arguments": "{\"q\"" }
+                }]
+            }),
+        );
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "function": { "arguments": ":\"rust\"}" }
+                }]
+            }),
+        );
+
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "search");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"q\":\"rust\"}");
+        assert!(calls[0].get("index").is_none());
+    }
+
+    #[test]
+    fn merges_tool_call_input_deltas_and_overwrites_changed_metadata() {
+        let mut calls = Vec::new();
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!({
+                "tool_calls": [{
+                    "index": 1,
+                    "id": "call_1",
+                    "type": "function",
+                    "name": "draft",
+                    "input": "{\"city\""
+                }]
+            }),
+        );
+        merge_tool_call_deltas(
+            &mut calls,
+            &json!({
+                "tool_calls": [{
+                    "index": 1,
+                    "name": "weather",
+                    "input": ":\"Paris\"}"
+                }]
+            }),
+        );
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], json!({}));
+        assert_eq!(calls[1]["id"], "call_1");
+        assert_eq!(calls[1]["type"], "function");
+        assert_eq!(calls[1]["name"], "weather");
+        assert_eq!(calls[1]["input"], "{\"city\":\"Paris\"}");
+    }
+
+    #[test]
+    fn merge_delta_value_replaces_non_object_targets() {
+        let mut target = json!("old");
+        merge_delta_value(&mut target, &json!({ "id": "call_1" }));
+
+        assert_eq!(target, json!({ "id": "call_1" }));
+    }
 }

@@ -10,7 +10,7 @@ pub enum Request {
     /// Standard text-generation request: forwards the client's overrideable
     /// args plus a captured stdin buffer to the server.
     Run {
-        args: ClientArgs,
+        args: Box<ClientArgs>,
         /// Stdin buffer captured by the client. The server uses this in place
         /// of its own stdin when `--messages` is not supplied.
         stdin: String,
@@ -74,4 +74,58 @@ where
     serde_json::from_str(trimmed)
         .map(Some)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncWriteExt, BufReader, duplex};
+
+    use super::*;
+    use crate::tools::ToolSource;
+
+    #[tokio::test]
+    async fn json_lines_round_trip_run_requests_with_boxed_client_args() {
+        let (mut writer, reader) = duplex(4096);
+        let mut reader = BufReader::new(reader);
+        let request = Request::Run {
+            args: Box::new(ClientArgs {
+                model: Some("model-a".to_string()),
+                simple: true,
+                tools: vec![ToolSource::Inline(
+                    "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}".to_string(),
+                )],
+                ..ClientArgs::default()
+            }),
+            stdin: "hello".to_string(),
+        };
+
+        write_json_line(&mut writer, &request).await.unwrap();
+        drop(writer);
+        let decoded: Request = read_json_line(&mut reader).await.unwrap().unwrap();
+
+        match decoded {
+            Request::Run { args, stdin } => {
+                assert_eq!(args.model.as_deref(), Some("model-a"));
+                assert!(args.simple);
+                assert_eq!(args.tools.len(), 1);
+                assert_eq!(stdin, "hello");
+            }
+            Request::Status => panic!("expected run request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_json_line_returns_none_on_eof_and_errors_on_invalid_json() {
+        let (writer, reader) = duplex(64);
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let value: Option<Frame> = read_json_line(&mut reader).await.unwrap();
+        assert!(value.is_none());
+
+        let (mut writer, reader) = duplex(64);
+        let mut reader = BufReader::new(reader);
+        writer.write_all(b"not json\n").await.unwrap();
+        let err = read_json_line::<Frame, _>(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

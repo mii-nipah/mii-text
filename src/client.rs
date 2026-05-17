@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::tokio::prelude::*;
@@ -11,12 +11,10 @@ use crate::conversation::{
 };
 use crate::ipc::{Frame, Request, read_json_line, write_json_line};
 use crate::sink::Sink;
+use crate::tools;
 
 pub async fn run_status(args: Args) -> Result<u8, String> {
-    let socket_path: PathBuf = args
-        .ipc_path
-        .clone()
-        .unwrap_or_else(default_ipc_socket);
+    let socket_path: PathBuf = args.ipc_path.clone().unwrap_or_else(default_ipc_socket);
 
     let conn = connect(&socket_path).await?;
     let (recv, mut send) = conn.split();
@@ -57,10 +55,7 @@ pub async fn run_status(args: Args) -> Result<u8, String> {
 }
 
 pub async fn run_ipc(args: Args) -> Result<u8, String> {
-    let socket_path: PathBuf = args
-        .ipc_path
-        .clone()
-        .unwrap_or_else(default_ipc_socket);
+    let socket_path: PathBuf = args.ipc_path.clone().unwrap_or_else(default_ipc_socket);
 
     // Resolve the full conversation locally (history + new turns) so the
     // server doesn't need access to the client's filesystem for stateful or
@@ -89,9 +84,12 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
     client_args.out = None;
     client_args.quick = false;
     client_args.messages = Some(
-        serde_json::to_string(&conversation)
-            .map_err(|e| format!("serialize messages: {}", e))?,
+        serde_json::to_string(&conversation).map_err(|e| format!("serialize messages: {}", e))?,
     );
+    if !args.tools.is_empty() {
+        let resolved = tools::resolve(&args.tools).await?.unwrap_or_default();
+        client_args.tools = tools::resolved_sources(resolved);
+    }
 
     let conn = connect(&socket_path).await?;
     let (recv, mut send) = conn.split();
@@ -100,7 +98,7 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
     write_json_line(
         &mut send,
         &Request::Run {
-            args: client_args,
+            args: Box::new(client_args),
             stdin: String::new(),
         },
     )
@@ -146,25 +144,49 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
         .map_err(|e| format!("flush output: {}", e))?;
 
     if let (Some(p), Some(text)) = (&args.stateful, assistant) {
-        conversation.push(Message {
-            role: "assistant".to_string(),
-            content: text,
-        });
+        conversation.push(Message::assistant(text));
         save_stateful(p, &conversation).await?;
     }
 
     Ok(exit_code)
 }
 
-async fn connect(path: &PathBuf) -> Result<Stream, String> {
+async fn connect(path: &Path) -> Result<Stream, String> {
     let name = path
-        .as_path()
         .to_fs_name::<GenericFilePath>()
         .map_err(|e| format!("invalid socket path: {}", e))?;
     Stream::connect(name).await.map_err(|e| match e.kind() {
         std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
-            format!("connection {} unreachable (is `mii-text --serve` running?)", path.display())
+            format!(
+                "connection {} unreachable (is `mii-text --serve` running?)",
+                path.display()
+            )
         }
         _ => format!("connect {}: {}", path.display(), e),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_reports_unreachable_socket_with_hint() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mii-text-missing-socket-{}-{unique}.sock",
+            std::process::id()
+        ));
+
+        let err = connect(&path).await.unwrap_err();
+
+        assert!(err.contains(&path.display().to_string()));
+        assert!(err.contains("unreachable"));
+        assert!(err.contains("mii-text --serve"));
+    }
 }

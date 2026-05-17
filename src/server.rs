@@ -104,7 +104,7 @@ async fn handle_connection(
     };
 
     let (args, stdin) = match req {
-        Request::Run { args, stdin } => (args, stdin),
+        Request::Run { args, stdin } => (*args, stdin),
         Request::Status => {
             log!(quiet, "#{} status ping", id);
             let info = StatusInfo {
@@ -144,6 +144,9 @@ async fn handle_connection(
         temperature,
         max_tokens,
         reasoning_summary,
+        tools,
+        completions,
+        simple,
     } = args;
     let merged_client = ClientArgs {
         model,
@@ -159,6 +162,9 @@ async fn handle_connection(
         temperature,
         max_tokens,
         reasoning_summary,
+        tools,
+        completions,
+        simple,
     };
     let client_wants_stats = merged_client.stats;
 
@@ -296,10 +302,87 @@ fn clone_args(a: &Args) -> Args {
         temperature: a.temperature,
         max_tokens: a.max_tokens,
         reasoning_summary: a.reasoning_summary,
+        tools: a.tools.clone(),
+        completions: a.completions,
+        simple: a.simple,
         serve: false,
         ipc: false,
         ipc_path: None,
         status: false,
         quiet: a.quiet,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::tools::ToolSource;
+
+    #[test]
+    fn clone_args_preserves_defaults_but_strips_runtime_modes() {
+        let args = Args {
+            key: Some("key".to_string()),
+            url: Some("https://example.test/v1".to_string()),
+            model: Some("model-a".to_string()),
+            stream: true,
+            out: Some(PathBuf::from("out.txt")),
+            system: Some("system".to_string()),
+            messages: Some("[]".to_string()),
+            quick: true,
+            stateful: Some(PathBuf::from("state.json")),
+            reasoning: Some("low".to_string()),
+            stats: true,
+            cache: Some(PathBuf::from("cache.db")),
+            temperature: Some(0.2),
+            max_tokens: Some(123),
+            reasoning_summary: true,
+            tools: vec![ToolSource::Inline(
+                "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}".to_string(),
+            )],
+            completions: true,
+            simple: true,
+            serve: true,
+            ipc: true,
+            ipc_path: Some(PathBuf::from("sock")),
+            status: true,
+            quiet: true,
+        };
+
+        let cloned = clone_args(&args);
+
+        assert_eq!(cloned.key.as_deref(), Some("key"));
+        assert_eq!(cloned.url.as_deref(), Some("https://example.test/v1"));
+        assert_eq!(cloned.model.as_deref(), Some("model-a"));
+        assert!(cloned.stream);
+        assert_eq!(
+            cloned.out.as_deref(),
+            Some(PathBuf::from("out.txt").as_path())
+        );
+        assert_eq!(cloned.system.as_deref(), Some("system"));
+        assert_eq!(cloned.messages.as_deref(), Some("[]"));
+        assert!(cloned.quick);
+        assert_eq!(
+            cloned.stateful.as_deref(),
+            Some(PathBuf::from("state.json").as_path())
+        );
+        assert_eq!(cloned.reasoning.as_deref(), Some("low"));
+        assert!(cloned.stats);
+        assert_eq!(
+            cloned.cache.as_deref(),
+            Some(PathBuf::from("cache.db").as_path())
+        );
+        assert_eq!(cloned.temperature, Some(0.2));
+        assert_eq!(cloned.max_tokens, Some(123));
+        assert!(cloned.reasoning_summary);
+        assert_eq!(cloned.tools.len(), 1);
+        assert!(cloned.completions);
+        assert!(cloned.simple);
+        assert!(!cloned.serve);
+        assert!(!cloned.ipc);
+        assert_eq!(cloned.ipc_path, None);
+        assert!(!cloned.status);
+        assert!(cloned.quiet);
     }
 }
