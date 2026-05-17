@@ -6,7 +6,7 @@ It's completely stateless in principle, so the user may invoke it without worrie
 A semi-stateful API exists as a convenient "illusion" so users can have a continuous experience with it if.
 
 * `--key <string>`: specifies your API key
-You can also pass OPENAI_API_KEY as an env var to the process.
+You can also pass OPENAI_API_KEY as an env var to the process. Required for OpenAI's default API, optional for custom `--url` endpoints that do not require authentication.
 
 * `--url <string>`: specifies the base URL of your API
 (optional if you want to use openai models directly)
@@ -15,7 +15,8 @@ You can also pass OPENAI_BASE_URL as an env var to the process.
 * `--model <string>`: specifies the model name you want to use
 You can also pass OPENAI_MODEL_NAME as an env var to the process.
 
-* `--stream`: enables streaming of the responses
+* `--stream`: enables streaming of the responses as JSONL events by default. With `--simple`, streams plain text chunks as before.
+OpenAI Responses requests use provider streaming internally even when this flag is omitted; the flag only controls whether mii-text exposes JSONL incrementally or buffers and renders one final output.
 
 * `--out <path>`: changes the output mode from stdout to a file
 
@@ -43,17 +44,31 @@ specifies the reasoning level of the model, if it's not supported by the model i
 * `--stats`: prints some stats about the request after it's done (tokens, latency, etc) in stderr
 (if used with `--serve` it implies server logs will contain stats, not the clients)
 
-* `--cache <path>`: enables caching of the responses using a simple sqlite database to speed up repeated requests without requiring additional inferences
+* `--cache <path>`: enables caching of the canonical response prospect and captured stream events using a simple sqlite database to speed up repeated requests without requiring additional inferences. Cached prospects can be replayed through structured JSON, JSONL, or `--simple` text output modes. Cached JSONL should preserve original delta boundaries when the event log is available.
 
 * `--temperature <float>`: specifies the temperature to use for the generation
 
 * `--max-tokens <int>`: specifies the maximum number of tokens to generate (default: 128_000)
 
-* `--reasoning-summary`: enables 'auto' reasoning summary for models, which will be appended to the output within special `<think>` `</think>` tags independent of the provider, and will not be included in the stateful conversation history
+* `--reasoning-summary`: explicitly enables 'auto' reasoning summary for models. Structured non-streaming output asks for this by default and returns it in the `reasoning` output field; streaming and `--simple` output only include reasoning when this flag is present. With `--simple`, it will be appended to the output within special `<think>` `</think>` tags independent of the provider, and will not be included in the stateful conversation history
+
+* `--completions`: forces the legacy Chat Completions API. OpenAI requests use the Responses API by default; non-OpenAI compatible endpoints keep using Chat Completions for compatibility.
+
+* `--simple`: restores the old plain-text output format. Without it, non-streaming output is a JSON object with `reasoning`, `content`, `tool_calls`, and `provider_continuation`; streaming output is JSONL with `content_delta`, `tool_calls`, optional `provider_continuation`, and `done` events by default. Add `--reasoning-summary` to streaming output to receive `reasoning_delta` events. The final `done` event is a complete prospect snapshot, so it repeats any completed `tool_calls` and `provider_continuation` already emitted as events.
+
+* `--tool <json>`: adds one tool definition to the request. Can be repeated.
+
+* `--tools <path>`: reads tool definitions from a json file. The file may be a single tool object, an array of tool objects, or an object with a top-level `tools` array.
+
+Tool definitions are sent to the provider's `tools` request field. Function tools can be written in mii-text's compact style (`{"name":...,"input_schema":...}`), Responses style (`{"type":"function","name":...}`), or Chat Completions style (`{"type":"function","function":{...}}`); mii-text normalizes `input_schema` to `parameters` and adapts the wrapper for the provider it uses.
+
+If the model returns tool calls instead of text, mii-text writes them in the `tool_calls` output field. In `--simple` mode it writes the tool-call json array to stdout. It does not execute tools itself.
+
+OpenAI Responses requests are stateless (`store: false`) and always request `reasoning.encrypted_content`. When OpenAI returns encrypted reasoning items, mii-text exposes them as `provider_continuation`; users can include the `provider_continuation` object, or the streamed `{"type":"provider_continuation","provider":"openai","reasoning_items":[...]}` event shape, in later `--messages` arrays to round-trip those opaque items back into Responses input. Chat Completions-compatible providers ignore these provider-private continuation items.
 
 ## serve mode / client mode
 * `--serve`: starts a simple IPC server using the *interprocess* crate with some default configurations, so other processes can have an easier experience with mii-text without having to worry about the arguments or API keys
-in this mode it's required to have an url and api key (either by argument or env), the other arguments are all optional. If you provide an argument in the server and the "clients" don't it will use the server's argument as the default, otherwise client will dominate
+in this mode OpenAI URLs require an api key (either by argument or env), while custom urls may run without one. The other arguments are all optional. If you provide an argument in the server and the "clients" don't it will use the server's argument as the default, otherwise client will dominate
 Example:
 ```bash
 OPENAI_API_KEY=$OPENAI_KEY_THING mii-text --serve --model 'gpt-5.4-mini' --reasoning xhigh --cache /tmp/cache.db

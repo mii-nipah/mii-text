@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::args::{Args, ClientArgs, default_ipc_socket};
 use crate::ipc::{Frame, Request, StatusInfo, read_json_line, write_json_line};
+use crate::providers::is_openai;
 use crate::sink::{ErrSink, Sink};
 
 static CONN_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -37,8 +38,18 @@ macro_rules! log {
 }
 
 pub async fn serve(server_args: Args) -> Result<(), String> {
-    if server_args.key.is_none() && std::env::var("OPENAI_API_KEY").is_err() {
-        return Err("--serve requires an API key (--key or OPENAI_API_KEY)".to_string());
+    let base_url = server_args
+        .url
+        .clone()
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok());
+    if serve_requires_key(
+        base_url.as_deref(),
+        server_args.key.as_deref(),
+        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+    ) {
+        return Err(
+            "--serve requires an API key (--key or OPENAI_API_KEY) for OpenAI URLs".to_string(),
+        );
     }
     let socket_path: PathBuf = server_args
         .ipc_path
@@ -83,6 +94,18 @@ pub async fn serve(server_args: Args) -> Result<(), String> {
     }
 }
 
+fn serve_requires_key(
+    base_url: Option<&str>,
+    explicit_key: Option<&str>,
+    env_key: Option<&str>,
+) -> bool {
+    let has_key = explicit_key
+        .or(env_key)
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false);
+    is_openai(base_url) && !has_key
+}
+
 async fn handle_connection(
     server_args: Arc<Args>,
     conn: Stream,
@@ -104,7 +127,7 @@ async fn handle_connection(
     };
 
     let (args, stdin) = match req {
-        Request::Run { args, stdin } => (args, stdin),
+        Request::Run { args, stdin } => (*args, stdin),
         Request::Status => {
             log!(quiet, "#{} status ping", id);
             let info = StatusInfo {
@@ -120,6 +143,7 @@ async fn handle_connection(
                 &Frame::Exit {
                     code: 0,
                     assistant: None,
+                    provider_continuation: None,
                 },
             )
             .await?;
@@ -144,6 +168,9 @@ async fn handle_connection(
         temperature,
         max_tokens,
         reasoning_summary,
+        tools,
+        completions,
+        simple,
     } = args;
     let merged_client = ClientArgs {
         model,
@@ -159,6 +186,9 @@ async fn handle_connection(
         temperature,
         max_tokens,
         reasoning_summary,
+        tools,
+        completions,
+        simple,
     };
     let client_wants_stats = merged_client.stats;
 
@@ -253,8 +283,8 @@ async fn handle_connection(
         write_json_line(&mut send, &Frame::Stderr { text: t }).await?;
     }
 
-    let (code, assistant) = match outcome {
-        Ok(o) => (o.exit_code, Some(o.assistant_buf)),
+    let (code, assistant, provider_continuation) = match outcome {
+        Ok(o) => (o.exit_code, Some(o.assistant_buf), o.provider_continuation),
         Err((code, msg)) => {
             write_json_line(
                 &mut send,
@@ -263,10 +293,18 @@ async fn handle_connection(
                 },
             )
             .await?;
-            (code, None)
+            (code, None, None)
         }
     };
-    write_json_line(&mut send, &Frame::Exit { code, assistant }).await?;
+    write_json_line(
+        &mut send,
+        &Frame::Exit {
+            code,
+            assistant,
+            provider_continuation,
+        },
+    )
+    .await?;
     log!(
         quiet,
         "#{} done code={} elapsed={}ms",
@@ -296,10 +334,104 @@ fn clone_args(a: &Args) -> Args {
         temperature: a.temperature,
         max_tokens: a.max_tokens,
         reasoning_summary: a.reasoning_summary,
+        tools: a.tools.clone(),
+        completions: a.completions,
+        simple: a.simple,
         serve: false,
         ipc: false,
         ipc_path: None,
         status: false,
         quiet: a.quiet,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::tools::ToolSource;
+
+    #[test]
+    fn clone_args_preserves_defaults_but_strips_runtime_modes() {
+        let args = Args {
+            key: Some("key".to_string()),
+            url: Some("https://example.test/v1".to_string()),
+            model: Some("model-a".to_string()),
+            stream: true,
+            out: Some(PathBuf::from("out.txt")),
+            system: Some("system".to_string()),
+            messages: Some("[]".to_string()),
+            quick: true,
+            stateful: Some(PathBuf::from("state.json")),
+            reasoning: Some("low".to_string()),
+            stats: true,
+            cache: Some(PathBuf::from("cache.db")),
+            temperature: Some(0.2),
+            max_tokens: Some(123),
+            reasoning_summary: true,
+            tools: vec![ToolSource::Inline(
+                "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}".to_string(),
+            )],
+            completions: true,
+            simple: true,
+            serve: true,
+            ipc: true,
+            ipc_path: Some(PathBuf::from("sock")),
+            status: true,
+            quiet: true,
+        };
+
+        let cloned = clone_args(&args);
+
+        assert_eq!(cloned.key.as_deref(), Some("key"));
+        assert_eq!(cloned.url.as_deref(), Some("https://example.test/v1"));
+        assert_eq!(cloned.model.as_deref(), Some("model-a"));
+        assert!(cloned.stream);
+        assert_eq!(
+            cloned.out.as_deref(),
+            Some(PathBuf::from("out.txt").as_path())
+        );
+        assert_eq!(cloned.system.as_deref(), Some("system"));
+        assert_eq!(cloned.messages.as_deref(), Some("[]"));
+        assert!(cloned.quick);
+        assert_eq!(
+            cloned.stateful.as_deref(),
+            Some(PathBuf::from("state.json").as_path())
+        );
+        assert_eq!(cloned.reasoning.as_deref(), Some("low"));
+        assert!(cloned.stats);
+        assert_eq!(
+            cloned.cache.as_deref(),
+            Some(PathBuf::from("cache.db").as_path())
+        );
+        assert_eq!(cloned.temperature, Some(0.2));
+        assert_eq!(cloned.max_tokens, Some(123));
+        assert!(cloned.reasoning_summary);
+        assert_eq!(cloned.tools.len(), 1);
+        assert!(cloned.completions);
+        assert!(cloned.simple);
+        assert!(!cloned.serve);
+        assert!(!cloned.ipc);
+        assert_eq!(cloned.ipc_path, None);
+        assert!(!cloned.status);
+        assert!(cloned.quiet);
+    }
+
+    #[test]
+    fn serve_requires_key_only_for_openai_urls() {
+        assert!(serve_requires_key(None, None, None));
+        assert!(serve_requires_key(
+            Some("https://api.openai.com/v1"),
+            None,
+            None
+        ));
+        assert!(!serve_requires_key(
+            Some("http://localhost:8080/v1"),
+            None,
+            None
+        ));
+        assert!(!serve_requires_key(None, Some("sk-explicit"), None));
+        assert!(!serve_requires_key(None, None, Some("sk-env")));
     }
 }

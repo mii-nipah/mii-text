@@ -15,13 +15,13 @@ pub fn normalize_responses_usage(u: &Value) -> Value {
         .get("output_tokens")
         .or_else(|| u.get("completion_tokens"))
         .and_then(|v| v.as_u64());
-    let total = u
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .or_else(|| match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p + c),
-            _ => None,
-        });
+    let total =
+        u.get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .or_else(|| match (prompt, completion) {
+                (Some(p), Some(c)) => Some(p + c),
+                _ => None,
+            });
     let reasoning = u
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -120,5 +120,90 @@ fn push_usage(out: &mut String, u: &Value) {
     }
     if let Some(t) = total_tok {
         let _ = writeln!(out, "total tokens: {}", t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn normalizes_responses_usage_and_derives_total_tokens() {
+        let usage = normalize_responses_usage(&json!({
+            "input_tokens": 3,
+            "output_tokens": 7,
+            "output_tokens_details": { "reasoning_tokens": 2 }
+        }));
+
+        assert_eq!(usage["prompt_tokens"], 3);
+        assert_eq!(usage["completion_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 10);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn normalizes_chat_shaped_usage_without_losing_existing_total() {
+        let usage = normalize_responses_usage(&json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 7,
+            "total_tokens": 99,
+            "completion_tokens_details": { "reasoning_tokens": 4 }
+        }));
+
+        assert_eq!(usage["prompt_tokens"], 3);
+        assert_eq!(usage["completion_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 99);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 4);
+    }
+
+    #[test]
+    fn format_stats_includes_usage_latency_first_token_and_throughput() {
+        let text = format_stats(
+            &Some("model-a".to_string()),
+            &Some(json!({
+                "prompt_tokens": 4,
+                "completion_tokens": 8,
+                "total_tokens": 12,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            })),
+            Duration::from_secs(2),
+            Some(Duration::from_millis(250)),
+        );
+
+        assert!(text.contains("--- stats ---"));
+        assert!(text.contains("model: model-a"));
+        assert!(text.contains("latency: 2.000s"));
+        assert!(text.contains("time to first token: 0.250s"));
+        assert!(text.contains("prompt tokens: 4"));
+        assert!(text.contains("completion tokens: 8"));
+        assert!(text.contains("reasoning tokens: 3"));
+        assert!(text.contains("total tokens: 12"));
+        assert!(text.contains("throughput: 4.0 tok/s"));
+    }
+
+    #[test]
+    fn format_stats_reports_missing_usage_and_cached_stats_do_not_claim_live_run() {
+        let missing = format_stats(&None, &None, Duration::ZERO, None);
+        assert!(missing.contains("usage: <not reported by server>"));
+        assert!(!missing.contains("throughput:"));
+
+        let zero_latency = format_stats(
+            &None,
+            &Some(json!({ "completion_tokens": 8 })),
+            Duration::ZERO,
+            None,
+        );
+        assert!(!zero_latency.contains("throughput:"));
+
+        let cached = format_cached_stats(
+            &Some("model-b".to_string()),
+            &Some(json!({ "total_tokens": 5 })),
+            Duration::from_millis(12),
+        );
+        assert!(cached.contains("--- stats (cached) ---"));
+        assert!(cached.contains("model: model-b"));
+        assert!(cached.contains("total tokens: 5"));
     }
 }
