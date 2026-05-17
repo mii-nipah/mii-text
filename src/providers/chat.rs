@@ -170,12 +170,14 @@ pub async fn call(
             .map_err(|e| (1u8, e))?;
     }
     let prospect = output.prospect().clone();
+    let events = output.events().to_vec();
     let assistant_buf = prospect.content.clone();
 
     Ok(CallOutcome {
         assistant_buf,
         full_output,
         prospect,
+        events,
         usage,
         model_used,
         first_token_at,

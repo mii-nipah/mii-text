@@ -11,6 +11,7 @@ pub struct CachedEntry {
     pub content: String,
     pub assistant: Option<String>,
     pub prospect: Option<Prospect>,
+    pub events: Option<Vec<Value>>,
     pub usage: Option<Value>,
     pub model: Option<String>,
 }
@@ -30,9 +31,19 @@ pub struct KeyParts<'a> {
     pub completions: bool,
 }
 
+pub struct StoreEntry<'a> {
+    pub key: &'a str,
+    pub content: &'a str,
+    pub assistant: &'a str,
+    pub prospect: &'a Prospect,
+    pub events: &'a [Value],
+    pub usage: &'a Option<Value>,
+    pub model: &'a Option<String>,
+}
+
 pub fn key(parts: KeyParts<'_>) -> String {
     let canonical = json!({
-        "v": 9,
+        "v": 10,
         "model": parts.model,
         "system": parts.system,
         "messages": parts.messages,
@@ -62,39 +73,43 @@ pub fn open(path: &Path) -> Result<Connection, String> {
     }
     let conn = Connection::open(path).map_err(|e| format!("open cache db: {}", e))?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS responses (\n             key TEXT PRIMARY KEY,\n             content TEXT NOT NULL,\n             assistant TEXT,\n             prospect TEXT,\n             usage TEXT,\n             model TEXT,\n             created_at INTEGER NOT NULL\n         );",
+        "CREATE TABLE IF NOT EXISTS responses (\n             key TEXT PRIMARY KEY,\n             content TEXT NOT NULL,\n             assistant TEXT,\n             prospect TEXT,\n             events TEXT,\n             usage TEXT,\n             model TEXT,\n             created_at INTEGER NOT NULL\n         );",
     )
     .map_err(|e| format!("init cache schema: {}", e))?;
     ensure_column(&conn, "assistant", "TEXT")?;
     ensure_column(&conn, "prospect", "TEXT")?;
+    ensure_column(&conn, "events", "TEXT")?;
     Ok(conn)
 }
 
 pub fn lookup(conn: &Connection, key: &str) -> Result<Option<CachedEntry>, String> {
     let row = conn
         .query_row(
-            "SELECT content, assistant, prospect, usage, model FROM responses WHERE key = ?1",
+            "SELECT content, assistant, prospect, events, usage, model FROM responses WHERE key = ?1",
             params![key],
             |r| {
                 let content: String = r.get(0)?;
                 let assistant: Option<String> = r.get(1)?;
                 let prospect: Option<String> = r.get(2)?;
-                let usage: Option<String> = r.get(3)?;
-                let model: Option<String> = r.get(4)?;
-                Ok((content, assistant, prospect, usage, model))
+                let events: Option<String> = r.get(3)?;
+                let usage: Option<String> = r.get(4)?;
+                let model: Option<String> = r.get(5)?;
+                Ok((content, assistant, prospect, events, usage, model))
             },
         )
         .optional()
         .map_err(|e| format!("cache lookup: {}", e))?;
     match row {
         None => Ok(None),
-        Some((content, assistant, prospect_str, usage_str, model)) => {
+        Some((content, assistant, prospect_str, events_str, usage_str, model)) => {
             let prospect = prospect_str.and_then(|s| serde_json::from_str(&s).ok());
+            let events = events_str.and_then(|s| serde_json::from_str(&s).ok());
             let usage = usage_str.and_then(|s| serde_json::from_str(&s).ok());
             Ok(Some(CachedEntry {
                 content,
                 assistant,
                 prospect,
+                events,
                 usage,
                 model,
             }))
@@ -102,18 +117,13 @@ pub fn lookup(conn: &Connection, key: &str) -> Result<Option<CachedEntry>, Strin
     }
 }
 
-pub fn store(
-    conn: &Connection,
-    key: &str,
-    content: &str,
-    assistant: &str,
-    prospect: &Prospect,
-    usage: &Option<Value>,
-    model: &Option<String>,
-) -> Result<(), String> {
-    let prospect_str =
-        serde_json::to_string(prospect).map_err(|e| format!("serialize cache prospect: {}", e))?;
-    let usage_str = usage
+pub fn store(conn: &Connection, entry: StoreEntry<'_>) -> Result<(), String> {
+    let prospect_str = serde_json::to_string(entry.prospect)
+        .map_err(|e| format!("serialize cache prospect: {}", e))?;
+    let events_str = serde_json::to_string(entry.events)
+        .map_err(|e| format!("serialize cache events: {}", e))?;
+    let usage_str = entry
+        .usage
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
     let now = std::time::SystemTime::now()
@@ -121,8 +131,17 @@ pub fn store(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     conn.execute(
-        "INSERT OR REPLACE INTO responses (key, content, assistant, prospect, usage, model, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![key, content, assistant, prospect_str, usage_str, model, now],
+        "INSERT OR REPLACE INTO responses (key, content, assistant, prospect, events, usage, model, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            entry.key,
+            entry.content,
+            entry.assistant,
+            prospect_str,
+            events_str,
+            usage_str,
+            entry.model,
+            now
+        ],
     )
     .map_err(|e| format!("cache store: {}", e))?;
     Ok(())
@@ -205,6 +224,7 @@ mod tests {
                 content TEXT NOT NULL,
                 assistant TEXT,
                 prospect TEXT,
+                events TEXT,
                 usage TEXT,
                 model TEXT,
                 created_at INTEGER NOT NULL
@@ -217,16 +237,21 @@ mod tests {
             reasoning: Some("because".to_string()),
             content: "rendered".to_string(),
             tool_calls: vec![json!({ "call_id": "call_1" })],
+            provider_continuation: None,
         };
+        let events = vec![json!({ "type": "content_delta", "delta": "rendered" })];
 
         store(
             &conn,
-            "key-a",
-            "{\"content\":\"rendered\"}\n",
-            "rendered",
-            &prospect,
-            &usage,
-            &model,
+            StoreEntry {
+                key: "key-a",
+                content: "{\"content\":\"rendered\"}\n",
+                assistant: "rendered",
+                prospect: &prospect,
+                events: &events,
+                usage: &usage,
+                model: &model,
+            },
         )
         .unwrap();
 
@@ -237,6 +262,7 @@ mod tests {
         assert_eq!(cached_prospect.reasoning.as_deref(), Some("because"));
         assert_eq!(cached_prospect.content, "rendered");
         assert_eq!(cached_prospect.tool_calls[0]["call_id"], "call_1");
+        assert_eq!(hit.events.unwrap(), events);
         assert_eq!(hit.usage, usage);
         assert_eq!(hit.model, model);
         assert!(lookup(&conn, "missing").unwrap().is_none());
@@ -267,6 +293,7 @@ mod tests {
         assert_eq!(hit.content, "old rendered");
         assert_eq!(hit.assistant, None);
         assert!(hit.prospect.is_none());
+        assert!(hit.events.is_none());
         assert_eq!(hit.usage, Some(json!({ "total_tokens": 8 })));
         assert_eq!(hit.model.as_deref(), Some("old-model"));
         let columns: Vec<String> = conn
@@ -278,6 +305,7 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|name| name == "assistant"));
         assert!(columns.iter().any(|name| name == "prospect"));
+        assert!(columns.iter().any(|name| name == "events"));
 
         drop(conn);
         let _ = std::fs::remove_file(path);
@@ -299,15 +327,19 @@ mod tests {
             reasoning: None,
             content: "assistant".to_string(),
             tool_calls: Vec::new(),
+            provider_continuation: None,
         };
         store(
             &conn,
-            "key-a",
-            "rendered",
-            "assistant",
-            &prospect,
-            &None,
-            &None,
+            StoreEntry {
+                key: "key-a",
+                content: "rendered",
+                assistant: "assistant",
+                prospect: &prospect,
+                events: &[],
+                usage: &None,
+                model: &None,
+            },
         )
         .unwrap();
         assert_eq!(

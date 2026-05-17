@@ -120,6 +120,7 @@ async fn handle_connection(
                 &Frame::Exit {
                     code: 0,
                     assistant: None,
+                    provider_continuation: None,
                 },
             )
             .await?;
@@ -259,8 +260,8 @@ async fn handle_connection(
         write_json_line(&mut send, &Frame::Stderr { text: t }).await?;
     }
 
-    let (code, assistant) = match outcome {
-        Ok(o) => (o.exit_code, Some(o.assistant_buf)),
+    let (code, assistant, provider_continuation) = match outcome {
+        Ok(o) => (o.exit_code, Some(o.assistant_buf), o.provider_continuation),
         Err((code, msg)) => {
             write_json_line(
                 &mut send,
@@ -269,10 +270,18 @@ async fn handle_connection(
                 },
             )
             .await?;
-            (code, None)
+            (code, None, None)
         }
     };
-    write_json_line(&mut send, &Frame::Exit { code, assistant }).await?;
+    write_json_line(
+        &mut send,
+        &Frame::Exit {
+            code,
+            assistant,
+            provider_continuation,
+        },
+    )
+    .await?;
     log!(
         quiet,
         "#{} done code={} elapsed={}ms",

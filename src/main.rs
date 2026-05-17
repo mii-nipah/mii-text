@@ -6,7 +6,10 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 
 use crate::args::{Args, DEFAULT_MAX_TOKENS, parse, usage};
-use crate::conversation::{Message, load_input_messages, load_stateful, save_stateful};
+use crate::conversation::{
+    Message, load_input_messages, load_stateful, push_assistant_turn, save_stateful,
+};
+use crate::output::ProviderContinuation;
 use crate::output::render_cached;
 use crate::providers::{CallParams, call as call_provider, should_include_reasoning};
 use crate::sink::{ErrSink, Sink};
@@ -79,6 +82,7 @@ pub struct RunOutcome {
     /// Final assistant message text (no `<think>` wrapping). Empty when no
     /// content was produced.
     pub assistant_buf: String,
+    pub provider_continuation: Option<ProviderContinuation>,
 }
 
 /// Core request execution shared by local, server, and (via the server)
@@ -177,12 +181,15 @@ pub async fn run(
     if let Some(conn) = &cache_conn {
         cache::store(
             conn,
-            &key_hash,
-            &outcome.full_output,
-            &outcome.assistant_buf,
-            &outcome.prospect,
-            &outcome.usage,
-            &outcome.model_used,
+            cache::StoreEntry {
+                key: &key_hash,
+                content: &outcome.full_output,
+                assistant: &outcome.assistant_buf,
+                prospect: &outcome.prospect,
+                events: &outcome.events,
+                usage: &outcome.usage,
+                model: &outcome.model_used,
+            },
         )
         .map_err(|e| (1u8, e))?;
     }
@@ -197,7 +204,12 @@ pub async fn run(
     }
 
     if let Some(p) = &args.stateful {
-        conversation.push(Message::assistant(outcome.assistant_buf.clone()));
+        push_assistant_turn(
+            &mut conversation,
+            outcome.assistant_buf.clone(),
+            outcome.prospect.provider_continuation.as_ref(),
+        )
+        .map_err(|e| (1u8, e))?;
         save_stateful(p, &conversation)
             .await
             .map_err(|e| (1u8, e))?;
@@ -206,6 +218,7 @@ pub async fn run(
     Ok(RunOutcome {
         exit_code: 0,
         assistant_buf: outcome.assistant_buf,
+        provider_continuation: outcome.prospect.provider_continuation,
     })
 }
 
@@ -217,21 +230,23 @@ async fn replay_cached(
     hit: cache::CachedEntry,
 ) -> Result<RunOutcome, (u8, String)> {
     let started = Instant::now();
-    let (rendered, assistant) = match hit.prospect {
+    let (rendered, assistant, continuation) = match hit.prospect {
         Some(prospect) => {
             let rendered = render_cached(
                 &prospect,
+                hit.events.as_deref(),
                 args.simple,
                 args.stream,
                 should_include_reasoning(args.reasoning_summary, args.stream, args.simple),
             )
             .map_err(|e| (1u8, e))?;
             let assistant = prospect.content.clone();
-            (rendered, assistant)
+            let continuation = prospect.provider_continuation.clone();
+            (rendered, assistant, continuation)
         }
         None => {
             let assistant = hit.assistant.unwrap_or_else(|| hit.content.clone());
-            (hit.content, assistant)
+            (hit.content, assistant, None)
         }
     };
     sink.write_str(&rendered)
@@ -248,11 +263,13 @@ async fn replay_cached(
         ));
     }
     if let Some(p) = &args.stateful {
-        conversation.push(Message::assistant(assistant.clone()));
+        push_assistant_turn(conversation, assistant.clone(), continuation.as_ref())
+            .map_err(|e| (1u8, e))?;
         save_stateful(p, conversation).await.map_err(|e| (1u8, e))?;
     }
     Ok(RunOutcome {
         exit_code: 0,
         assistant_buf: assistant,
+        provider_continuation: continuation,
     })
 }

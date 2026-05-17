@@ -9,6 +9,31 @@ pub struct Prospect {
     pub reasoning: Option<String>,
     pub content: String,
     pub tool_calls: Vec<Value>,
+    pub provider_continuation: Option<ProviderContinuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderContinuation {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_items: Vec<Value>,
+}
+
+impl ProviderContinuation {
+    pub fn stream_event(&self) -> Value {
+        let mut value =
+            serde_json::to_value(self).expect("provider continuation serializes as json object");
+        let object = value
+            .as_object_mut()
+            .expect("provider continuation serializes as json object");
+        object.insert(
+            "type".to_string(),
+            Value::String("provider_continuation".to_string()),
+        );
+        value
+    }
 }
 
 pub struct OutputWriter {
@@ -16,6 +41,8 @@ pub struct OutputWriter {
     stream: bool,
     emit_reasoning: bool,
     prospect: Prospect,
+    events: Vec<Value>,
+    final_events_recorded: bool,
     think_open: bool,
     think_closed: bool,
 }
@@ -27,6 +54,8 @@ impl OutputWriter {
             stream,
             emit_reasoning,
             prospect: Prospect::default(),
+            events: Vec::new(),
+            final_events_recorded: false,
             think_open: false,
             think_closed: false,
         }
@@ -45,6 +74,8 @@ impl OutputWriter {
             .reasoning
             .get_or_insert_with(String::new)
             .push_str(text);
+        self.events
+            .push(json!({ "type": "reasoning_delta", "delta": text }));
 
         if !self.emit_reasoning {
             return Ok(true);
@@ -83,6 +114,8 @@ impl OutputWriter {
             return Ok(false);
         }
         self.prospect.content.push_str(text);
+        self.events
+            .push(json!({ "type": "content_delta", "delta": text }));
 
         if self.simple && self.stream {
             self.close_think_if_open(sink, mirror).await?;
@@ -105,7 +138,12 @@ impl OutputWriter {
         self.prospect.tool_calls = tool_calls;
     }
 
+    pub fn set_provider_continuation(&mut self, continuation: ProviderContinuation) {
+        self.prospect.provider_continuation = Some(continuation);
+    }
+
     pub async fn finish(&mut self, sink: &mut Sink, mirror: &mut String) -> Result<(), String> {
+        self.record_final_events();
         let prospect = self.visible_prospect();
         if self.simple {
             if self.stream {
@@ -136,6 +174,9 @@ impl OutputWriter {
                 )
                 .await?;
             }
+            if let Some(continuation) = &prospect.provider_continuation {
+                write_jsonl(sink, mirror, continuation.stream_event()).await?;
+            }
             write_jsonl(
                 sink,
                 mirror,
@@ -144,6 +185,7 @@ impl OutputWriter {
                     "reasoning": prospect.reasoning,
                     "content": prospect.content,
                     "tool_calls": prospect.tool_calls,
+                    "provider_continuation": prospect.provider_continuation,
                 }),
             )
             .await?;
@@ -157,13 +199,34 @@ impl OutputWriter {
         &self.prospect
     }
 
+    pub fn events(&self) -> &[Value] {
+        &self.events
+    }
+
     fn visible_prospect(&self) -> Prospect {
         visible_prospect(&self.prospect, self.emit_reasoning)
+    }
+
+    fn record_final_events(&mut self) {
+        if self.final_events_recorded {
+            return;
+        }
+        self.final_events_recorded = true;
+        if !self.prospect.tool_calls.is_empty() {
+            self.events.push(json!({
+                "type": "tool_calls",
+                "tool_calls": self.prospect.tool_calls.clone(),
+            }));
+        }
+        if let Some(continuation) = &self.prospect.provider_continuation {
+            self.events.push(continuation.stream_event());
+        }
     }
 }
 
 pub fn render_cached(
     prospect: &Prospect,
+    events: Option<&[Value]>,
     simple: bool,
     stream: bool,
     emit_reasoning: bool,
@@ -173,6 +236,11 @@ pub fn render_cached(
         return simple_text(&prospect);
     }
     if stream {
+        if let Some(events) = events
+            && !events.is_empty()
+        {
+            return render_jsonl_events(events, &prospect, emit_reasoning);
+        }
         return render_jsonl(&prospect);
     }
     render_structured(&prospect)
@@ -230,6 +298,32 @@ fn render_jsonl(prospect: &Prospect) -> Result<String, String> {
             "reasoning": prospect.reasoning,
             "content": prospect.content,
             "tool_calls": prospect.tool_calls,
+            "provider_continuation": prospect.provider_continuation,
+        }),
+    )?;
+    Ok(text)
+}
+
+fn render_jsonl_events(
+    events: &[Value],
+    prospect: &Prospect,
+    emit_reasoning: bool,
+) -> Result<String, String> {
+    let mut text = String::new();
+    for event in events {
+        if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") && !emit_reasoning {
+            continue;
+        }
+        push_jsonl(&mut text, event.clone())?;
+    }
+    push_jsonl(
+        &mut text,
+        json!({
+            "type": "done",
+            "reasoning": prospect.reasoning,
+            "content": prospect.content,
+            "tool_calls": prospect.tool_calls,
+            "provider_continuation": prospect.provider_continuation,
         }),
     )?;
     Ok(text)
@@ -290,6 +384,7 @@ mod tests {
             reasoning: Some("because".to_string()),
             content: "hello".to_string(),
             tool_calls: vec![json!({ "name": "echo" })],
+            provider_continuation: None,
         };
         let value = serde_json::to_value(prospect).unwrap();
 
@@ -448,6 +543,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_stream_does_not_append_tool_calls_after_text_content() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_reasoning(true, true, true);
+
+        writer
+            .push_content(&mut sink, &mut mirror, "answer")
+            .await
+            .unwrap();
+        writer.set_tool_calls(vec![json!({ "call_id": "call_1" })]);
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "answer");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(mirror, "answer");
+    }
+
+    #[tokio::test]
+    async fn simple_stream_without_content_or_tool_calls_writes_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_reasoning(true, true, true);
+
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert!(mirror.is_empty());
+    }
+
+    #[tokio::test]
     async fn simple_non_streaming_defers_reasoning_until_finish() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut sink = Sink::channel(tx);
@@ -495,6 +622,61 @@ mod tests {
         assert_eq!(done["reasoning"], "because");
         assert_eq!(done["tool_calls"][0]["call_id"], "call_1");
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(writer.events().len(), 2);
+        assert_eq!(writer.events()[0]["type"], "reasoning_delta");
+        assert_eq!(writer.events()[1]["type"], "tool_calls");
+        assert_eq!(writer.events()[1]["tool_calls"][0]["call_id"], "call_1");
+    }
+
+    #[tokio::test]
+    async fn structured_stream_writes_provider_continuation_before_done() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_reasoning(false, true, true);
+
+        writer.set_provider_continuation(ProviderContinuation {
+            provider: "openai".to_string(),
+            response_id: Some("resp_1".to_string()),
+            reasoning_items: vec![json!({
+                "type": "reasoning",
+                "encrypted_content": "opaque"
+            })],
+        });
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        let continuation: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let done: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(continuation["type"], "provider_continuation");
+        assert_eq!(continuation["provider"], "openai");
+        assert_eq!(
+            continuation["reasoning_items"][0]["encrypted_content"],
+            "opaque"
+        );
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["provider_continuation"]["response_id"], "resp_1");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(writer.events().len(), 1);
+        assert_eq!(writer.events()[0]["type"], "provider_continuation");
+    }
+
+    #[tokio::test]
+    async fn final_events_are_recorded_only_once() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_reasoning(false, true, true);
+
+        writer.set_tool_calls(vec![json!({ "call_id": "call_1" })]);
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        let tool_events = writer
+            .events()
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_calls"))
+            .count();
+        assert_eq!(tool_events, 1);
     }
 
     #[tokio::test]
@@ -527,21 +709,24 @@ mod tests {
             reasoning: Some("because".to_string()),
             content: "answer".to_string(),
             tool_calls: vec![json!({ "call_id": "call_1" })],
+            provider_continuation: None,
         };
 
         let structured: Value =
-            serde_json::from_str(&render_cached(&prospect, false, false, true).unwrap()).unwrap();
+            serde_json::from_str(&render_cached(&prospect, None, false, false, true).unwrap())
+                .unwrap();
         assert_eq!(structured["reasoning"], "because");
         assert_eq!(structured["content"], "answer");
 
         let hidden: Value =
-            serde_json::from_str(&render_cached(&prospect, false, false, false).unwrap()).unwrap();
+            serde_json::from_str(&render_cached(&prospect, None, false, false, false).unwrap())
+                .unwrap();
         assert_eq!(hidden["reasoning"], Value::Null);
 
-        let simple = render_cached(&prospect, true, false, true).unwrap();
+        let simple = render_cached(&prospect, None, true, false, true).unwrap();
         assert_eq!(simple, "<think>because</think>\nanswer");
 
-        let jsonl = render_cached(&prospect, false, true, true).unwrap();
+        let jsonl = render_cached(&prospect, None, false, true, true).unwrap();
         let lines = jsonl
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -550,5 +735,32 @@ mod tests {
         assert_eq!(lines[1]["type"], "content_delta");
         assert_eq!(lines[2]["type"], "tool_calls");
         assert_eq!(lines[3]["type"], "done");
+    }
+
+    #[test]
+    fn cached_stream_rendering_replays_event_chunks_losslessly() {
+        let prospect = Prospect {
+            reasoning: Some("because".to_string()),
+            content: "answer".to_string(),
+            tool_calls: Vec::new(),
+            provider_continuation: None,
+        };
+        let events = vec![
+            json!({ "type": "reasoning_delta", "delta": "because" }),
+            json!({ "type": "content_delta", "delta": "ans" }),
+            json!({ "type": "content_delta", "delta": "wer" }),
+        ];
+
+        let jsonl = render_cached(&prospect, Some(&events), false, true, false).unwrap();
+        let lines = jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], json!({ "type": "content_delta", "delta": "ans" }));
+        assert_eq!(lines[1], json!({ "type": "content_delta", "delta": "wer" }));
+        assert_eq!(lines[2]["type"], "done");
+        assert_eq!(lines[2]["reasoning"], Value::Null);
     }
 }

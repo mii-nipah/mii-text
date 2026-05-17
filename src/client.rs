@@ -7,7 +7,8 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::args::{Args, default_ipc_socket};
 use crate::conversation::{
-    Message, load_input_messages, load_stateful, read_stdin_to_string, save_stateful,
+    Message, load_input_messages, load_stateful, push_assistant_turn, read_stdin_to_string,
+    save_stateful,
 };
 use crate::ipc::{Frame, Request, read_json_line, write_json_line};
 use crate::sink::Sink;
@@ -112,6 +113,7 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
     let mut stderr = tokio::io::stderr();
     let mut exit_code: u8 = 1;
     let mut assistant: Option<String> = None;
+    let mut provider_continuation = None;
 
     while let Some(frame) = read_json_line::<Frame, _>(&mut reader)
         .await
@@ -128,9 +130,14 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
                     .await
                     .map_err(|e| format!("write stderr: {}", e))?;
             }
-            Frame::Exit { code, assistant: a } => {
+            Frame::Exit {
+                code,
+                assistant: a,
+                provider_continuation: continuation,
+            } => {
                 exit_code = code;
                 assistant = a;
+                provider_continuation = continuation;
                 break;
             }
             Frame::Status { .. } => {
@@ -144,7 +151,7 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
         .map_err(|e| format!("flush output: {}", e))?;
 
     if let (Some(p), Some(text)) = (&args.stateful, assistant) {
-        conversation.push(Message::assistant(text));
+        push_assistant_turn(&mut conversation, text, provider_continuation.as_ref())?;
         save_stateful(p, &conversation).await?;
     }
 

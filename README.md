@@ -159,22 +159,44 @@ Tool calls are returned in the `tool_calls` output field. In `--simple` mode, if
   {
     "reasoning": "summary text, or null if the provider did not return one",
     "content": "answer text",
-    "tool_calls": []
+    "tool_calls": [],
+    "provider_continuation": null
   }
   ```
-  OpenAI Responses requests ask for a reasoning summary by default in this mode.
+  OpenAI Responses requests ask for a reasoning summary by default in this mode. They also request encrypted reasoning continuation data; when the provider returns it, `provider_continuation` contains opaque OpenAI items that can be passed back on a later turn.
 - `--stream` changes stdout to JSONL events:
   ```jsonl
   {"type":"content_delta","delta":"answer "}
   {"type":"content_delta","delta":"text"}
-  {"type":"done","reasoning":null,"content":"answer text","tool_calls":[]}
+  {"type":"done","reasoning":null,"content":"answer text","tool_calls":[],"provider_continuation":null}
   ```
-  Reasoning summaries are omitted by default while streaming; pass `--reasoning-summary` to receive `reasoning_delta` events. Tool calls use a `tool_calls` event before `done`, and the final `done` event repeats the complete accumulated `tool_calls` array as part of the final prospect snapshot.
+  Reasoning summaries are omitted by default while streaming; pass `--reasoning-summary` to receive `reasoning_delta` events. Tool calls use a `tool_calls` event before `done`. OpenAI encrypted continuation data uses a `provider_continuation` event before `done` when present. The final `done` event repeats the complete accumulated `tool_calls` and `provider_continuation` values as part of the final prospect snapshot.
 - `--simple` restores the previous text-only stdout contract. `--simple --stream` streams text chunks as before. Pass `--reasoning-summary` to restore the old `<think>…</think>` prefix behavior.
 - `--out <path>` — write the response to a file instead of stdout.
 - `--stats` — print token counts, latency, and time-to-first-token to stderr after completion. In `--serve` mode this enables stats logging on the server, not on clients.
 
 For OpenAI Responses requests, mii-text uses the provider's streaming API internally even when `--stream` is not set. Without `--stream`, it buffers the events and renders the final prospect as one JSON object or simple text.
+
+### Provider continuation
+
+For OpenAI Responses requests, mii-text sends `store: false` and `include: ["reasoning.encrypted_content"]`. If OpenAI returns encrypted reasoning items, mii-text exposes them without interpreting them:
+
+```json
+{
+  "provider": "openai",
+  "response_id": "resp_...",
+  "reasoning_items": [
+    {
+      "type": "reasoning",
+      "id": "rs_...",
+      "summary": [],
+      "encrypted_content": "..."
+    }
+  ]
+}
+```
+
+To continue a stateless Responses conversation, include that object as an item in your next `--messages` array. mii-text also accepts the streamed event shape with `"type": "provider_continuation"`, and expands `reasoning_items` into the OpenAI `input` array before sending the request.
 
 ### Stateful conversations
 
@@ -183,13 +205,13 @@ For OpenAI Responses requests, mii-text uses the provider's streaming API intern
 1. Loads the file (if it exists) as the prior history.
 2. Appends new messages from `--messages` / stdin / `--quick`.
 3. Sends the whole thing to the model.
-4. Appends the assistant reply and writes the file back.
+4. Appends the assistant reply and any provider continuation item, then writes the file back.
 
 The file format is the same as `--messages`, so you can hand-edit it or pipe it through other tooling.
 
 ### Cache
 
-`--cache <path>` opens (or creates) a SQLite database. The cache key is a hash of model, system prompt, conversation, reasoning level, temperature, max tokens, tools, and provider mode. Cache entries store the canonical prospect, so the same model result can replay as structured JSON, JSONL, or `--simple` text without contacting the API.
+`--cache <path>` opens (or creates) a SQLite database. The cache key is a hash of model, system prompt, conversation, reasoning level, temperature, max tokens, tools, and provider mode. Cache entries store the canonical prospect and the captured stream event log, so the same model result can replay as structured JSON, JSONL, or `--simple` text without contacting the API. Cached JSONL keeps the original delta boundaries when the event log is available.
 
 ## Server / client mode
 

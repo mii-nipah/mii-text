@@ -5,6 +5,8 @@ use serde_json::{Map, Value, json};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
+use crate::output::ProviderContinuation;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -42,6 +44,22 @@ impl Message {
         }
         Value::Object(object)
     }
+
+    pub fn from_value(value: Value) -> Result<Self, String> {
+        serde_json::from_value(value).map_err(|e| format!("invalid message json: {}", e))
+    }
+}
+
+pub fn push_assistant_turn(
+    messages: &mut Vec<Message>,
+    content: String,
+    continuation: Option<&ProviderContinuation>,
+) -> Result<(), String> {
+    messages.push(Message::assistant(content));
+    if let Some(continuation) = continuation {
+        messages.push(Message::from_value(continuation.stream_event())?);
+    }
+    Ok(())
 }
 
 pub async fn read_stdin_to_string() -> std::io::Result<String> {
@@ -158,6 +176,30 @@ mod tests {
                 "call_id": "call_2",
                 "output": "done"
             })
+        );
+    }
+
+    #[test]
+    fn assistant_turn_can_preserve_provider_continuation() {
+        let mut messages = Vec::new();
+        let continuation = ProviderContinuation {
+            provider: "openai".to_string(),
+            response_id: Some("resp_1".to_string()),
+            reasoning_items: vec![json!({
+                "type": "reasoning",
+                "encrypted_content": "opaque"
+            })],
+        };
+
+        push_assistant_turn(&mut messages, "answer".to_string(), Some(&continuation)).unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].to_api_value()["role"], "assistant");
+        assert_eq!(messages[0].to_api_value()["content"], "answer");
+        assert_eq!(messages[1].to_api_value()["type"], "provider_continuation");
+        assert_eq!(
+            messages[1].to_api_value()["reasoning_items"][0]["encrypted_content"],
+            "opaque"
         );
     }
 

@@ -44,7 +44,7 @@ specifies the reasoning level of the model, if it's not supported by the model i
 * `--stats`: prints some stats about the request after it's done (tokens, latency, etc) in stderr
 (if used with `--serve` it implies server logs will contain stats, not the clients)
 
-* `--cache <path>`: enables caching of the canonical response prospect using a simple sqlite database to speed up repeated requests without requiring additional inferences. Cached prospects can be replayed through structured JSON, JSONL, or `--simple` text output modes.
+* `--cache <path>`: enables caching of the canonical response prospect and captured stream events using a simple sqlite database to speed up repeated requests without requiring additional inferences. Cached prospects can be replayed through structured JSON, JSONL, or `--simple` text output modes. Cached JSONL should preserve original delta boundaries when the event log is available.
 
 * `--temperature <float>`: specifies the temperature to use for the generation
 
@@ -54,7 +54,7 @@ specifies the reasoning level of the model, if it's not supported by the model i
 
 * `--completions`: forces the legacy Chat Completions API. OpenAI requests use the Responses API by default; non-OpenAI compatible endpoints keep using Chat Completions for compatibility.
 
-* `--simple`: restores the old plain-text output format. Without it, non-streaming output is a JSON object with `reasoning`, `content`, and `tool_calls`; streaming output is JSONL with `content_delta`, `tool_calls`, and `done` events by default. Add `--reasoning-summary` to streaming output to receive `reasoning_delta` events. The final `done` event is a complete prospect snapshot, so it repeats any completed `tool_calls` already emitted as an event.
+* `--simple`: restores the old plain-text output format. Without it, non-streaming output is a JSON object with `reasoning`, `content`, `tool_calls`, and `provider_continuation`; streaming output is JSONL with `content_delta`, `tool_calls`, optional `provider_continuation`, and `done` events by default. Add `--reasoning-summary` to streaming output to receive `reasoning_delta` events. The final `done` event is a complete prospect snapshot, so it repeats any completed `tool_calls` and `provider_continuation` already emitted as events.
 
 * `--tool <json>`: adds one tool definition to the request. Can be repeated.
 
@@ -63,6 +63,8 @@ specifies the reasoning level of the model, if it's not supported by the model i
 Tool definitions are sent to the provider's `tools` request field. Function tools can be written in mii-text's compact style (`{"name":...,"input_schema":...}`), Responses style (`{"type":"function","name":...}`), or Chat Completions style (`{"type":"function","function":{...}}`); mii-text normalizes `input_schema` to `parameters` and adapts the wrapper for the provider it uses.
 
 If the model returns tool calls instead of text, mii-text writes them in the `tool_calls` output field. In `--simple` mode it writes the tool-call json array to stdout. It does not execute tools itself.
+
+OpenAI Responses requests are stateless (`store: false`) and always request `reasoning.encrypted_content`. When OpenAI returns encrypted reasoning items, mii-text exposes them as `provider_continuation`; users can include the `provider_continuation` object, or the streamed `{"type":"provider_continuation","provider":"openai","reasoning_items":[...]}` event shape, in later `--messages` arrays to round-trip those opaque items back into Responses input.
 
 ## serve mode / client mode
 * `--serve`: starts a simple IPC server using the *interprocess* crate with some default configurations, so other processes can have an easier experience with mii-text without having to worry about the arguments or API keys

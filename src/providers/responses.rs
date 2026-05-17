@@ -6,22 +6,61 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::args::map_reasoning;
-use crate::output::OutputWriter;
+use crate::output::{OutputWriter, ProviderContinuation};
 use crate::sink::Sink;
 use crate::stats::normalize_responses_usage;
 use crate::tools;
 
 use super::{CallOutcome, CallParams, should_include_reasoning};
 
-fn build_input(system: &Option<String>, msgs: &[crate::conversation::Message]) -> Vec<Value> {
+fn build_input(
+    system: &Option<String>,
+    msgs: &[crate::conversation::Message],
+) -> Result<Vec<Value>, String> {
     let mut out: Vec<Value> = Vec::with_capacity(msgs.len() + 1);
     if let Some(sys) = system {
         out.push(json!({ "role": "system", "content": sys }));
     }
     for m in msgs {
-        out.push(m.to_api_value());
+        append_input_item(&mut out, m.to_api_value())?;
     }
-    out
+    Ok(out)
+}
+
+fn append_input_item(out: &mut Vec<Value>, item: Value) -> Result<(), String> {
+    if !is_provider_continuation_wrapper(&item) {
+        out.push(item);
+        return Ok(());
+    }
+
+    let provider = item
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("openai");
+    if provider != "openai" {
+        return Err(format!(
+            "provider_continuation for provider '{}' cannot be sent to OpenAI",
+            provider
+        ));
+    }
+
+    let reasoning_items = item
+        .get("reasoning_items")
+        .or_else(|| item.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "provider_continuation requires a reasoning_items array".to_string())?;
+    out.extend(reasoning_items.iter().cloned());
+    Ok(())
+}
+
+fn is_provider_continuation_wrapper(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) == Some("provider_continuation") {
+        return true;
+    }
+    item.get("role").is_none()
+        && item.get("content").is_none()
+        && item.get("provider").is_some()
+        && item.get("reasoning_items").is_some()
 }
 
 pub async fn call(
@@ -29,12 +68,14 @@ pub async fn call(
     sink: &mut Sink,
     params: CallParams<'_>,
 ) -> Result<CallOutcome, (u8, String)> {
-    let input = build_input(params.system, params.messages);
+    let input = build_input(params.system, params.messages).map_err(|e| (1u8, e))?;
 
     let mut body = json!({
         "model": params.model,
         "input": input,
         "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
         "max_output_tokens": params.max_tokens,
     });
     let emit_reasoning =
@@ -148,6 +189,11 @@ pub async fn call(
                             )
                             .await?;
                         }
+                        if let Some(continuation) =
+                            extract_provider_continuation(resp, output_items)
+                        {
+                            output.set_provider_continuation(continuation);
+                        }
                     }
                 }
             }
@@ -168,12 +214,14 @@ pub async fn call(
         .await
         .map_err(|e| (1u8, e))?;
     let prospect = output.prospect().clone();
+    let events = output.events().to_vec();
     let assistant_buf = prospect.content.clone();
 
     Ok(CallOutcome {
         assistant_buf,
         full_output,
         prospect,
+        events,
         usage,
         model_used,
         first_token_at,
@@ -243,6 +291,39 @@ fn extract_reasoning_summary(output: &[Value]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+fn extract_provider_continuation(
+    response: &Value,
+    output: &[Value],
+) -> Option<ProviderContinuation> {
+    let reasoning_items = output
+        .iter()
+        .filter(|item| is_encrypted_continuation_item(item))
+        .cloned()
+        .collect::<Vec<_>>();
+    if reasoning_items.is_empty() {
+        return None;
+    }
+
+    Some(ProviderContinuation {
+        provider: "openai".to_string(),
+        response_id: response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        reasoning_items,
+    })
+}
+
+fn is_encrypted_continuation_item(item: &Value) -> bool {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    matches!(item_type, "reasoning" | "compaction")
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map(|content| !content.is_empty())
+            .unwrap_or(false)
+}
+
 fn append_reasoning_text(value: Option<&Value>, out: &mut String) {
     match value {
         Some(Value::Array(items)) => {
@@ -297,7 +378,7 @@ mod tests {
             .unwrap(),
         ];
 
-        let input = build_input(&system, &messages);
+        let input = build_input(&system, &messages).unwrap();
 
         assert_eq!(input.len(), 3);
         assert_eq!(
@@ -312,6 +393,122 @@ mod tests {
                 "call_id": "call_1",
                 "output": "done"
             })
+        );
+    }
+
+    #[test]
+    fn build_input_expands_provider_continuation_items() {
+        let messages = vec![
+            serde_json::from_value(json!({
+                "provider": "openai",
+                "response_id": "resp_1",
+                "reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [],
+                        "encrypted_content": "opaque"
+                    }
+                ]
+            }))
+            .unwrap(),
+            Message::user("continue".to_string()),
+        ];
+
+        let input = build_input(&None, &messages).unwrap();
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "opaque");
+        assert_eq!(input[1], json!({ "role": "user", "content": "continue" }));
+    }
+
+    #[test]
+    fn build_input_accepts_streamed_provider_continuation_event_shape() {
+        let messages = vec![
+            serde_json::from_value(json!({
+                "type": "provider_continuation",
+                "provider": "openai",
+                "reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    }
+                ]
+            }))
+            .unwrap(),
+        ];
+
+        let input = build_input(&None, &messages).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn build_input_does_not_treat_provider_metadata_as_continuation() {
+        let messages = vec![
+            serde_json::from_value(json!({
+                "provider": "openai",
+                "content": "ordinary metadata"
+            }))
+            .unwrap(),
+        ];
+
+        let input = build_input(&None, &messages).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["provider"], "openai");
+        assert_eq!(input[0]["content"], "ordinary metadata");
+    }
+
+    #[test]
+    fn build_input_requires_provider_marker_for_untyped_continuation() {
+        let messages = vec![
+            serde_json::from_value(json!({
+                "reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque"
+                    }
+                ]
+            }))
+            .unwrap(),
+        ];
+
+        let input = build_input(&None, &messages).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(
+            input[0]["reasoning_items"][0]["encrypted_content"],
+            "opaque"
+        );
+    }
+
+    #[test]
+    fn extracts_encrypted_reasoning_continuation() {
+        let continuation = extract_provider_continuation(
+            &json!({ "id": "resp_1" }),
+            &[
+                json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "encrypted_content": "opaque"
+                }),
+                json!({ "type": "reasoning", "summary": [] }),
+                json!({ "type": "function_call", "call_id": "call_1" }),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(continuation.provider, "openai");
+        assert_eq!(continuation.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(continuation.reasoning_items.len(), 1);
+        assert_eq!(
+            continuation.reasoning_items[0]["encrypted_content"],
+            "opaque"
         );
     }
 

@@ -30,6 +30,7 @@ pub struct CallOutcome {
     pub assistant_buf: String,
     pub full_output: String,
     pub prospect: Prospect,
+    pub events: Vec<Value>,
     pub usage: Option<Value>,
     pub model_used: Option<String>,
     pub first_token_at: Option<Duration>,
