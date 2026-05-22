@@ -7,13 +7,14 @@ use async_openai::config::OpenAIConfig;
 
 use crate::args::{Args, DEFAULT_MAX_TOKENS, parse, usage};
 use crate::constraints::{
-    apply_first_pass_prompt, parse_constrained_response, second_pass_messages,
+    apply_first_pass_prompt, normalize_openai_schema, parse_constrained_response,
+    second_pass_messages,
 };
 use crate::conversation::{
     Message, load_input_messages, load_stateful, push_assistant_turn, save_stateful,
 };
 use crate::output::ProviderContinuation;
-use crate::output::render_cached;
+use crate::output::{render_cached, render_done};
 use crate::providers::{CallParams, call as call_provider, is_openai, should_include_reasoning};
 use crate::sink::{ErrSink, Sink};
 use crate::stats::{combine_usage, format_cached_stats, format_stats};
@@ -117,14 +118,23 @@ pub async fn run(
         .map_err(|e| (1u8, e))?;
     conversation.extend(new_messages);
 
+    let base_url = args
+        .url
+        .clone()
+        .or_else(|| env::var("OPENAI_BASE_URL").ok());
     let max_tokens = args.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     let tools = tools::resolve(&args.tools).await.map_err(|e| (1u8, e))?;
     let schema = match &args.schema {
-        Some(raw) => Some(
-            constraints::resolve_schema(raw)
+        Some(raw) => {
+            let schema = constraints::resolve_schema(raw)
                 .await
-                .map_err(|e| (1u8, e))?,
-        ),
+                .map_err(|e| (1u8, e))?;
+            if is_openai(base_url.as_deref()) {
+                Some(normalize_openai_schema(&schema))
+            } else {
+                Some(schema)
+            }
+        }
         None => None,
     };
     let key_hash = cache::key(cache::KeyParts {
@@ -149,10 +159,6 @@ pub async fn run(
         return replay_cached(args, sink, err, &mut conversation, hit).await;
     }
 
-    let base_url = args
-        .url
-        .clone()
-        .or_else(|| env::var("OPENAI_BASE_URL").ok());
     let api_key = api_key_for_base_url(
         args.key.clone().and_then(non_empty).as_deref(),
         env::var("OPENAI_API_KEY")
@@ -201,6 +207,7 @@ pub async fn run(
                     stats: args.stats,
                     tools: &tools,
                     schema: None,
+                    emit_done: true,
                     completions: args.completions,
                     simple: args.simple,
                 },
@@ -273,6 +280,60 @@ struct ConstrainedRequest<'a> {
     base_url: Option<&'a str>,
 }
 
+struct ConstrainedPassRequest<'a, 's> {
+    client: &'a Client<OpenAIConfig>,
+    sink: &'s mut Sink,
+    args: &'a Args,
+    model: &'a str,
+    messages: &'a [Message],
+    tools: &'a Option<Vec<serde_json::Value>>,
+    schema: Option<&'a serde_json::Value>,
+    max_tokens: u32,
+    base_url: Option<&'a str>,
+    stream: bool,
+    emit_done: bool,
+}
+
+async fn call_constrained_pass(
+    req: ConstrainedPassRequest<'_, '_>,
+) -> Result<providers::CallOutcome, (u8, String)> {
+    let ConstrainedPassRequest {
+        client,
+        sink,
+        args,
+        model,
+        messages,
+        tools,
+        schema,
+        max_tokens,
+        base_url,
+        stream,
+        emit_done,
+    } = req;
+    call_provider(
+        client,
+        sink,
+        CallParams {
+            model,
+            system: &args.system,
+            messages,
+            stream,
+            reasoning: &args.reasoning,
+            temperature: args.temperature,
+            max_tokens,
+            reasoning_summary: args.reasoning_summary,
+            stats: args.stats,
+            tools,
+            schema,
+            emit_done,
+            completions: args.completions,
+            simple: false,
+        },
+        base_url,
+    )
+    .await
+}
+
 async fn run_constrained_request(
     req: ConstrainedRequest<'_>,
 ) -> Result<providers::CallOutcome, (u8, String)> {
@@ -288,28 +349,39 @@ async fn run_constrained_request(
         base_url,
     } = req;
     let first_pass_messages = apply_first_pass_prompt(conversation, schema);
-    let mut first_sink = Sink::memory();
-    let first = call_provider(
-        client,
-        &mut first_sink,
-        CallParams {
+    let stream_first_pass = args.stream && !args.simple;
+    let first = if stream_first_pass {
+        call_constrained_pass(ConstrainedPassRequest {
+            client,
+            sink,
+            args,
             model,
-            system: &args.system,
             messages: &first_pass_messages,
-            stream: false,
-            reasoning: &args.reasoning,
-            temperature: args.temperature,
-            max_tokens,
-            reasoning_summary: args.reasoning_summary,
-            stats: args.stats,
             tools,
             schema: None,
-            completions: args.completions,
-            simple: false,
-        },
-        base_url,
-    )
-    .await?;
+            max_tokens,
+            base_url,
+            stream: true,
+            emit_done: false,
+        })
+        .await?
+    } else {
+        let mut first_sink = Sink::memory();
+        call_constrained_pass(ConstrainedPassRequest {
+            client,
+            sink: &mut first_sink,
+            args,
+            model,
+            messages: &first_pass_messages,
+            tools,
+            schema: None,
+            max_tokens,
+            base_url,
+            stream: false,
+            emit_done: true,
+        })
+        .await?
+    };
 
     let constrained_messages = second_pass_messages(&first_pass_messages, &first.prospect);
     let mut second_sink = Sink::memory();
@@ -329,6 +401,7 @@ async fn run_constrained_request(
             stats: args.stats,
             tools: &no_tools,
             schema: Some(schema),
+            emit_done: true,
             completions: args.completions,
             simple: false,
         },
@@ -340,17 +413,29 @@ async fn run_constrained_request(
     let mut prospect = first.prospect.clone();
     prospect.constrained = Some(constrained);
     let events = first.events.clone();
-    let full_output = render_cached(
-        &prospect,
-        Some(&events),
-        args.simple,
-        args.stream,
-        should_include_reasoning(args.reasoning_summary, args.stream, args.simple),
-    )
-    .map_err(|e| (1u8, e))?;
-    sink.write_str(&full_output)
-        .await
-        .map_err(|e| (1u8, format!("write output: {}", e)))?;
+    let emit_reasoning = should_include_reasoning(args.reasoning_summary, args.stream, args.simple);
+    let full_output = if stream_first_pass {
+        let done = render_done(&prospect, emit_reasoning).map_err(|e| (1u8, e))?;
+        sink.write_str(&done)
+            .await
+            .map_err(|e| (1u8, format!("write output: {}", e)))?;
+        let mut full_output = first.full_output;
+        full_output.push_str(&done);
+        full_output
+    } else {
+        let full_output = render_cached(
+            &prospect,
+            Some(&events),
+            args.simple,
+            args.stream,
+            emit_reasoning,
+        )
+        .map_err(|e| (1u8, e))?;
+        sink.write_str(&full_output)
+            .await
+            .map_err(|e| (1u8, format!("write output: {}", e)))?;
+        full_output
+    };
     let assistant_buf = prospect.content.clone();
 
     Ok(providers::CallOutcome {

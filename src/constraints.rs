@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::fs;
 
 use crate::conversation::Message;
@@ -31,6 +31,12 @@ pub fn schema_guidance(schema: &Value) -> String {
         vec!["Please answer the above question with the following structure:".to_string()];
     append_schema_lines(schema, None, 0, &mut lines);
     lines.join("\n")
+}
+
+pub fn normalize_openai_schema(schema: &Value) -> Value {
+    let mut normalized = schema.clone();
+    normalize_schema_node(&mut normalized);
+    normalized
 }
 
 pub fn apply_first_pass_prompt(messages: &[Message], schema: &Value) -> Vec<Message> {
@@ -74,7 +80,7 @@ pub fn parse_constrained_response(content: &str) -> Result<Value, String> {
 }
 
 pub fn response_format_for_chat(schema: &Value) -> Value {
-    serde_json::json!({
+    json!({
         "type": "json_schema",
         "json_schema": {
             "name": "mii_text_constrained_response",
@@ -84,7 +90,7 @@ pub fn response_format_for_chat(schema: &Value) -> Value {
 }
 
 pub fn text_format_for_responses(schema: &Value) -> Value {
-    serde_json::json!({
+    json!({
         "format": {
             "type": "json_schema",
             "name": "mii_text_constrained_response",
@@ -109,6 +115,83 @@ fn draft_text(first: &Prospect) -> String {
         return String::new();
     }
     serde_json::to_string_pretty(&first.tool_calls).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn normalize_schema_node(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property_schema in properties.values_mut() {
+            normalize_schema_node(property_schema);
+        }
+    }
+
+    if is_object_schema(object) {
+        if !object.contains_key("additionalProperties") {
+            object.insert("additionalProperties".to_string(), Value::Bool(false));
+        }
+        if !object.contains_key("required") {
+            let required = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .cloned()
+                        .map(Value::String)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            object.insert("required".to_string(), Value::Array(required));
+        }
+    }
+
+    for key in ["items", "contains", "not", "if", "then", "else"] {
+        if let Some(child) = object.get_mut(key) {
+            normalize_schema_or_schema_array(child);
+        }
+    }
+    for key in [
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "prefixItems",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            normalize_schema_or_schema_array(child);
+        }
+    }
+}
+
+fn normalize_schema_or_schema_array(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                normalize_schema_node(item);
+            }
+        }
+        Value::Object(map) if map.values().all(Value::is_object) => {
+            for item in map.values_mut() {
+                normalize_schema_node(item);
+            }
+        }
+        Value::Object(_) => normalize_schema_node(value),
+        _ => {}
+    }
+}
+
+fn is_object_schema(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("type").and_then(Value::as_str) == Some("object")
+        || object
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some()
 }
 
 fn append_schema_lines(schema: &Value, name: Option<&str>, depth: usize, lines: &mut Vec<String>) {
@@ -222,5 +305,92 @@ mod tests {
         assert_eq!(chat["json_schema"]["schema"]["type"], "object");
         assert_eq!(responses["format"]["type"], "json_schema");
         assert_eq!(responses["format"]["schema"]["type"], "object");
+    }
+
+    #[test]
+    fn openai_schema_normalization_fills_missing_object_strictness() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "year": { "type": "integer" }
+                    }
+                }
+            }
+        });
+
+        let normalized = normalize_openai_schema(&schema);
+
+        assert_eq!(normalized["additionalProperties"], false);
+        assert_eq!(normalized["required"], json!(["metadata", "title"]));
+        assert_eq!(
+            normalized["properties"]["metadata"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            normalized["properties"]["metadata"]["required"],
+            json!(["year"])
+        );
+        assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn openai_schema_normalization_preserves_explicit_required_and_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["title"],
+            "properties": {
+                "title": { "type": "string" },
+                "year": { "type": "integer" }
+            }
+        });
+
+        let normalized = normalize_openai_schema(&schema);
+
+        assert_eq!(normalized["additionalProperties"], true);
+        assert_eq!(normalized["required"], json!(["title"]));
+    }
+
+    #[test]
+    fn openai_schema_normalization_handles_arrays_and_unions() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" }
+                        }
+                    }
+                },
+                "choice": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string" }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let normalized = normalize_openai_schema(&schema);
+
+        assert_eq!(
+            normalized["properties"]["items"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            normalized["properties"]["choice"]["anyOf"][0]["required"],
+            json!(["kind"])
+        );
     }
 }

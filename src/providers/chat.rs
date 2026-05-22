@@ -50,7 +50,12 @@ pub async fn call(
     let mut full_output = String::new();
     let emit_reasoning =
         should_include_reasoning(params.reasoning_summary, params.stream, params.simple);
-    let mut output = OutputWriter::with_reasoning(params.simple, params.stream, emit_reasoning);
+    let mut output = OutputWriter::with_done(
+        params.simple,
+        params.stream,
+        emit_reasoning,
+        params.emit_done,
+    );
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut usage: Option<Value> = None;
     let mut model_used: Option<String> = None;

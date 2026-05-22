@@ -167,6 +167,10 @@ echo 'Who directed Brazil and when was it released?' | mii-text --quick \
 
 Default output keeps the normal answer and adds a `constrained` field. In `--simple` mode, stdout is only the constrained JSON value. When `--stateful` is used, the constrained value is saved in the assistant turn but omitted from future model context so it does not confuse later prompts.
 
+For OpenAI endpoints, mii-text fills in strict object-schema defaults when they are missing: `additionalProperties: false` and `required` containing all property names. Custom `--url` backends receive the schema exactly as supplied.
+
+With `--stream`, mii-text emits the first-pass JSONL deltas as they arrive and waits to emit the final `done` event until the constrained JSON is ready.
+
 ### Output and stats
 
 - Default stdout is one JSON object:

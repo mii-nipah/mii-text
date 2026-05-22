@@ -45,12 +45,18 @@ pub struct OutputWriter {
     prospect: Prospect,
     events: Vec<Value>,
     final_events_recorded: bool,
+    emit_done: bool,
     think_open: bool,
     think_closed: bool,
 }
 
 impl OutputWriter {
+    #[cfg(test)]
     pub fn with_reasoning(simple: bool, stream: bool, emit_reasoning: bool) -> Self {
+        Self::with_done(simple, stream, emit_reasoning, true)
+    }
+
+    pub fn with_done(simple: bool, stream: bool, emit_reasoning: bool, emit_done: bool) -> Self {
         Self {
             simple,
             stream,
@@ -58,6 +64,7 @@ impl OutputWriter {
             prospect: Prospect::default(),
             events: Vec::new(),
             final_events_recorded: false,
+            emit_done,
             think_open: false,
             think_closed: false,
         }
@@ -179,7 +186,9 @@ impl OutputWriter {
             if let Some(continuation) = &prospect.provider_continuation {
                 write_jsonl(sink, mirror, continuation.stream_event()).await?;
             }
-            write_jsonl(sink, mirror, done_event(&prospect)).await?;
+            if self.emit_done {
+                write_jsonl(sink, mirror, done_event(&prospect)).await?;
+            }
             return Ok(());
         }
 
@@ -235,6 +244,13 @@ pub fn render_cached(
         return render_jsonl(&prospect);
     }
     render_structured(&prospect)
+}
+
+pub fn render_done(prospect: &Prospect, emit_reasoning: bool) -> Result<String, String> {
+    let prospect = visible_prospect(prospect, emit_reasoning);
+    let mut text = String::new();
+    push_jsonl(&mut text, done_event(&prospect))?;
+    Ok(text)
 }
 
 fn visible_prospect(prospect: &Prospect, emit_reasoning: bool) -> Prospect {
@@ -653,6 +669,33 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(writer.events().len(), 1);
         assert_eq!(writer.events()[0]["type"], "provider_continuation");
+    }
+
+    #[tokio::test]
+    async fn structured_stream_can_defer_done_until_later() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_done(false, true, true, false);
+
+        writer
+            .push_content(&mut sink, &mut mirror, "draft")
+            .await
+            .unwrap();
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        let delta: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(delta["type"], "content_delta");
+        assert_eq!(delta["delta"], "draft");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(writer.events().len(), 1);
+
+        let mut prospect = writer.prospect().clone();
+        prospect.constrained = Some(json!({ "answer": "draft" }));
+        let done: Value = serde_json::from_str(&render_done(&prospect, true).unwrap()).unwrap();
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["content"], "draft");
+        assert_eq!(done["constrained"]["answer"], "draft");
     }
 
     #[tokio::test]
