@@ -18,6 +18,7 @@ It is stateless by default, with an opt-in "stateful illusion" for continuous co
   - [Inputs](#inputs)
   - [Generation knobs](#generation-knobs)
   - [Tools](#tools)
+  - [Schema-constrained output](#schema-constrained-output)
   - [Output and stats](#output-and-stats)
   - [Stateful conversations](#stateful-conversations)
   - [Cache](#cache)
@@ -37,6 +38,7 @@ It is stateless by default, with an opt-in "stateful illusion" for continuous co
 - Streaming JSONL (`--stream`) for incremental responses.
 - Plain text compatibility mode (`--simple`) for scripts that only want the model content.
 - Tool schemas from repeated `--tool <json>` flags or a `--tools <path>` file.
+- Schema-constrained output with `--schema <path|json>` using a two-pass structured-output flow.
 - Reasoning controls (`--reasoning`, `--reasoning-summary`) for models that support them.
 - SQLite response cache (`--cache`) keyed on the canonical model request and reusable across output modes.
 - IPC server (`--serve`) and client (`--ipc`) over a Unix domain socket so secrets and defaults live in one place.
@@ -154,6 +156,21 @@ or the Chat Completions-style nested `function` shape. mii-text normalizes `inpu
 
 Tool calls are returned in the `tool_calls` output field. In `--simple` mode, if the model returns tool calls instead of text, mii-text prints the tool-call JSON array to stdout so it can be piped into your own executor.
 
+### Schema-constrained output
+
+- `--schema <path|json>` — run a two-pass request that first lets the model answer normally with guidance extracted from the JSON schema, then asks the model to convert that answer into JSON using the provider's JSON-schema response format.
+
+```bash
+echo 'Who directed Brazil and when was it released?' | mii-text --quick \
+  --schema '{"type":"object","properties":{"title":{"type":"string"},"director":{"type":"string"},"year":{"type":"integer"}}}'
+```
+
+Default output keeps the normal answer and adds a `constrained` field. In `--simple` mode, stdout is only the constrained JSON value. When `--stateful` is used, the constrained value is saved in the assistant turn but omitted from future model context so it does not confuse later prompts.
+
+For OpenAI endpoints, mii-text fills in strict object-schema defaults when they are missing: `additionalProperties: false` and `required` containing all property names. Custom `--url` backends receive the schema exactly as supplied.
+
+With `--stream`, mii-text emits the first-pass JSONL deltas as they arrive and waits to emit the final `done` event until the constrained JSON is ready.
+
 ### Output and stats
 
 - Default stdout is one JSON object:
@@ -162,7 +179,8 @@ Tool calls are returned in the `tool_calls` output field. In `--simple` mode, if
     "reasoning": "summary text, or null if the provider did not return one",
     "content": "answer text",
     "tool_calls": [],
-    "provider_continuation": null
+    "provider_continuation": null,
+    "constrained": { "present": "only when --schema is used" }
   }
   ```
   OpenAI Responses requests ask for a reasoning summary by default in this mode. They also request encrypted reasoning continuation data; when the provider returns it, `provider_continuation` contains opaque OpenAI items that can be passed back on a later turn.

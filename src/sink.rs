@@ -52,6 +52,7 @@ pub enum Sink {
     /// Sends each write as a separate string into a channel. Used by the
     /// `--serve` mode to forward streamed text frames to a connected client.
     Channel(UnboundedSender<String>),
+    Memory(String),
 }
 
 impl Sink {
@@ -71,6 +72,17 @@ impl Sink {
         Sink::Channel(tx)
     }
 
+    pub fn memory() -> Self {
+        Sink::Memory(String::new())
+    }
+
+    pub fn into_memory(self) -> Option<String> {
+        match self {
+            Sink::Memory(text) => Some(text),
+            _ => None,
+        }
+    }
+
     pub async fn write_str(&mut self, s: &str) -> std::io::Result<()> {
         match self {
             Sink::Stdout(o) => {
@@ -81,6 +93,10 @@ impl Sink {
             Sink::Channel(tx) => tx.send(s.to_string()).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ipc client disconnected")
             }),
+            Sink::Memory(text) => {
+                text.push_str(s);
+                Ok(())
+            }
         }
     }
 
@@ -89,6 +105,7 @@ impl Sink {
             Sink::Stdout(o) => o.flush().await,
             Sink::File(f) => f.flush().await,
             Sink::Channel(_) => Ok(()),
+            Sink::Memory(_) => Ok(()),
         }
     }
 }
@@ -111,6 +128,17 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), "hello");
         assert_eq!(rx.try_recv().unwrap(), " world");
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn memory_sink_buffers_written_text() {
+        let mut sink = Sink::memory();
+
+        sink.write_str("hello").await.unwrap();
+        sink.write_str(" world").await.unwrap();
+        sink.finish().await.unwrap();
+
+        assert_eq!(sink.into_memory().as_deref(), Some("hello world"));
     }
 
     #[test]

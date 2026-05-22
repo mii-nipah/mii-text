@@ -42,6 +42,7 @@ pub struct ClientArgs {
     pub max_tokens: Option<u32>,
     pub reasoning_summary: bool,
     pub tools: Vec<ToolSource>,
+    pub schema: Option<String>,
     pub completions: bool,
     pub simple: bool,
 }
@@ -64,6 +65,7 @@ pub struct Args {
     pub max_tokens: Option<u32>,
     pub reasoning_summary: bool,
     pub tools: Vec<ToolSource>,
+    pub schema: Option<String>,
     pub completions: bool,
     pub simple: bool,
     pub serve: bool,
@@ -91,6 +93,7 @@ impl Args {
             max_tokens: self.max_tokens,
             reasoning_summary: self.reasoning_summary,
             tools: self.tools.clone(),
+            schema: self.schema.clone(),
             completions: self.completions,
             simple: self.simple,
         }
@@ -142,6 +145,9 @@ impl Args {
         if !c.tools.is_empty() {
             self.tools = c.tools;
         }
+        if c.schema.is_some() {
+            self.schema = c.schema;
+        }
         if c.completions {
             self.completions = true;
         }
@@ -156,7 +162,7 @@ pub fn usage() -> &'static str {
                     [--system <s>] [--messages <json>] [--quick] [--stateful <path>]\n\
                     [--reasoning <none|low|medium|high|xhigh>] [--stats] [--cache <path>]\n\
                     [--temperature <float>] [--max-tokens <int>] [--reasoning-summary]\n\
-                    [--tool <json>] [--tools <path>] [--completions] [--simple]\n\
+                    [--tool <json>] [--tools <path>] [--schema <path|json>] [--completions] [--simple]\n\
                     [--serve] [--ipc [<path>]] [--status] [--quiet]"
 }
 
@@ -236,6 +242,7 @@ fn parse_from(tokens: Vec<String>) -> Result<Args, String> {
             "--tools" => args.tools.push(ToolSource::File(PathBuf::from(need(
                 &mut i, &tokens, "--tools",
             )?))),
+            "--schema" => args.schema = Some(need(&mut i, &tokens, "--schema")?),
             "--completions" => args.completions = true,
             "--simple" => args.simple = true,
             "--quiet" => args.quiet = true,
@@ -305,6 +312,8 @@ mod tests {
             "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}",
             "--tools",
             "tools.json",
+            "--schema",
+            "{\"type\":\"object\"}",
             "--completions",
             "--simple",
             "--serve",
@@ -342,6 +351,7 @@ mod tests {
         assert_eq!(args.tools.len(), 2);
         assert!(matches!(args.tools[0], ToolSource::Inline(_)));
         assert!(matches!(args.tools[1], ToolSource::File(_)));
+        assert_eq!(args.schema.as_deref(), Some("{\"type\":\"object\"}"));
         assert!(args.completions);
         assert!(args.simple);
         assert!(args.serve);
@@ -446,6 +456,8 @@ mod tests {
             "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}",
             "--completions",
             "--simple",
+            "--schema",
+            "schema.json",
         ])
         .unwrap();
 
@@ -474,6 +486,7 @@ mod tests {
         assert_eq!(client.max_tokens, Some(99));
         assert!(client.reasoning_summary);
         assert_eq!(client.tools.len(), 1);
+        assert_eq!(client.schema.as_deref(), Some("schema.json"));
         assert!(client.completions);
         assert!(client.simple);
     }
@@ -500,6 +513,7 @@ mod tests {
             tools: vec![ToolSource::Inline(
                 "{\"name\":\"client\",\"input_schema\":{\"type\":\"object\"}}".to_string(),
             )],
+            schema: Some("{\"type\":\"object\"}".to_string()),
             completions: true,
             simple: false,
             ..ClientArgs::default()
@@ -515,6 +529,7 @@ mod tests {
             other => panic!("unexpected tool source: {other:?}"),
         }
         assert!(server.completions);
+        assert_eq!(server.schema.as_deref(), Some("{\"type\":\"object\"}"));
         assert!(server.simple);
     }
 
@@ -524,6 +539,7 @@ mod tests {
 
         assert!(text.contains("--tool <json>"));
         assert!(text.contains("--tools <path>"));
+        assert!(text.contains("--schema <path|json>"));
         assert!(text.contains("--completions"));
         assert!(text.contains("--simple"));
     }

@@ -28,6 +28,7 @@ pub struct KeyParts<'a> {
     pub temperature: Option<f32>,
     pub max_tokens: u32,
     pub tools: &'a Option<Vec<Value>>,
+    pub schema: &'a Option<Value>,
     pub completions: bool,
 }
 
@@ -43,7 +44,7 @@ pub struct StoreEntry<'a> {
 
 pub fn key(parts: KeyParts<'_>) -> String {
     let canonical = json!({
-        "v": 10,
+        "v": 11,
         "model": parts.model,
         "system": parts.system,
         "messages": parts.messages,
@@ -51,6 +52,7 @@ pub fn key(parts: KeyParts<'_>) -> String {
         "temperature": parts.temperature,
         "max_tokens": parts.max_tokens,
         "tools": parts.tools,
+        "schema": parts.schema,
         "completions": parts.completions,
     });
     let serialized = serde_json::to_vec(&canonical).expect("canonical json");
@@ -181,6 +183,7 @@ mod tests {
         let system = Some("system".to_string());
         let reasoning = Some("low".to_string());
         let messages = vec![Message::user("hello".to_string())];
+        let schema = None;
         key(KeyParts {
             model: "model-a",
             system: &system,
@@ -189,7 +192,26 @@ mod tests {
             temperature: Some(0.5),
             max_tokens: 123,
             tools: &tools,
+            schema: &schema,
             completions,
+        })
+    }
+
+    fn key_for_schema(schema: Option<Value>) -> String {
+        let system = Some("system".to_string());
+        let reasoning = Some("low".to_string());
+        let messages = vec![Message::user("hello".to_string())];
+        let tools = None;
+        key(KeyParts {
+            model: "model-a",
+            system: &system,
+            messages: &messages,
+            reasoning: &reasoning,
+            temperature: Some(0.5),
+            max_tokens: 123,
+            tools: &tools,
+            schema: &schema,
+            completions: false,
         })
     }
 
@@ -210,6 +232,7 @@ mod tests {
 
         assert_ne!(base, key_for(Some(vec![json!({ "name": "echo" })]), false));
         assert_ne!(base, key_for(None, true));
+        assert_ne!(base, key_for_schema(Some(json!({ "type": "object" }))));
         assert_eq!(base, key_for(None, false));
         assert_eq!(base.len(), 64);
         assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
@@ -238,6 +261,7 @@ mod tests {
             content: "rendered".to_string(),
             tool_calls: vec![json!({ "call_id": "call_1" })],
             provider_continuation: None,
+            constrained: None,
         };
         let events = vec![json!({ "type": "content_delta", "delta": "rendered" })];
 
@@ -328,6 +352,7 @@ mod tests {
             content: "assistant".to_string(),
             tool_calls: Vec::new(),
             provider_continuation: None,
+            constrained: None,
         };
         store(
             &conn,

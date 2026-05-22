@@ -10,6 +10,8 @@ pub struct Prospect {
     pub content: String,
     pub tool_calls: Vec<Value>,
     pub provider_continuation: Option<ProviderContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,12 +45,18 @@ pub struct OutputWriter {
     prospect: Prospect,
     events: Vec<Value>,
     final_events_recorded: bool,
+    emit_done: bool,
     think_open: bool,
     think_closed: bool,
 }
 
 impl OutputWriter {
+    #[cfg(test)]
     pub fn with_reasoning(simple: bool, stream: bool, emit_reasoning: bool) -> Self {
+        Self::with_done(simple, stream, emit_reasoning, true)
+    }
+
+    pub fn with_done(simple: bool, stream: bool, emit_reasoning: bool, emit_done: bool) -> Self {
         Self {
             simple,
             stream,
@@ -56,6 +64,7 @@ impl OutputWriter {
             prospect: Prospect::default(),
             events: Vec::new(),
             final_events_recorded: false,
+            emit_done,
             think_open: false,
             think_closed: false,
         }
@@ -177,18 +186,9 @@ impl OutputWriter {
             if let Some(continuation) = &prospect.provider_continuation {
                 write_jsonl(sink, mirror, continuation.stream_event()).await?;
             }
-            write_jsonl(
-                sink,
-                mirror,
-                json!({
-                    "type": "done",
-                    "reasoning": prospect.reasoning,
-                    "content": prospect.content,
-                    "tool_calls": prospect.tool_calls,
-                    "provider_continuation": prospect.provider_continuation,
-                }),
-            )
-            .await?;
+            if self.emit_done {
+                write_jsonl(sink, mirror, done_event(&prospect)).await?;
+            }
             return Ok(());
         }
 
@@ -246,6 +246,13 @@ pub fn render_cached(
     render_structured(&prospect)
 }
 
+pub fn render_done(prospect: &Prospect, emit_reasoning: bool) -> Result<String, String> {
+    let prospect = visible_prospect(prospect, emit_reasoning);
+    let mut text = String::new();
+    push_jsonl(&mut text, done_event(&prospect))?;
+    Ok(text)
+}
+
 fn visible_prospect(prospect: &Prospect, emit_reasoning: bool) -> Prospect {
     let mut out = prospect.clone();
     if !emit_reasoning {
@@ -255,6 +262,13 @@ fn visible_prospect(prospect: &Prospect, emit_reasoning: bool) -> Prospect {
 }
 
 fn simple_text(prospect: &Prospect) -> Result<String, String> {
+    if let Some(constrained) = &prospect.constrained {
+        let mut text = serde_json::to_string_pretty(constrained)
+            .map_err(|e| format!("serialize constrained output: {}", e))?;
+        text.push('\n');
+        return Ok(text);
+    }
+
     let mut text = String::new();
     if let Some(reasoning) = &prospect.reasoning {
         text.push_str("<think>");
@@ -291,16 +305,7 @@ fn render_jsonl(prospect: &Prospect) -> Result<String, String> {
             json!({ "type": "tool_calls", "tool_calls": prospect.tool_calls }),
         )?;
     }
-    push_jsonl(
-        &mut text,
-        json!({
-            "type": "done",
-            "reasoning": prospect.reasoning,
-            "content": prospect.content,
-            "tool_calls": prospect.tool_calls,
-            "provider_continuation": prospect.provider_continuation,
-        }),
-    )?;
+    push_jsonl(&mut text, done_event(prospect))?;
     Ok(text)
 }
 
@@ -316,16 +321,7 @@ fn render_jsonl_events(
         }
         push_jsonl(&mut text, event.clone())?;
     }
-    push_jsonl(
-        &mut text,
-        json!({
-            "type": "done",
-            "reasoning": prospect.reasoning,
-            "content": prospect.content,
-            "tool_calls": prospect.tool_calls,
-            "provider_continuation": prospect.provider_continuation,
-        }),
-    )?;
+    push_jsonl(&mut text, done_event(prospect))?;
     Ok(text)
 }
 
@@ -334,6 +330,20 @@ fn render_structured(prospect: &Prospect) -> Result<String, String> {
         serde_json::to_string_pretty(prospect).map_err(|e| format!("serialize output: {}", e))?;
     text.push('\n');
     Ok(text)
+}
+
+fn done_event(prospect: &Prospect) -> Value {
+    let mut event = json!({
+        "type": "done",
+        "reasoning": prospect.reasoning,
+        "content": prospect.content,
+        "tool_calls": prospect.tool_calls,
+        "provider_continuation": prospect.provider_continuation,
+    });
+    if let Some(constrained) = &prospect.constrained {
+        event["constrained"] = constrained.clone();
+    }
+    event
 }
 
 fn push_jsonl(out: &mut String, value: Value) -> Result<(), String> {
@@ -385,6 +395,7 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: vec![json!({ "name": "echo" })],
             provider_continuation: None,
+            constrained: None,
         };
         let value = serde_json::to_value(prospect).unwrap();
 
@@ -661,6 +672,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_stream_can_defer_done_until_later() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = Sink::channel(tx);
+        let mut mirror = String::new();
+        let mut writer = OutputWriter::with_done(false, true, true, false);
+
+        writer
+            .push_content(&mut sink, &mut mirror, "draft")
+            .await
+            .unwrap();
+        writer.finish(&mut sink, &mut mirror).await.unwrap();
+
+        let delta: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(delta["type"], "content_delta");
+        assert_eq!(delta["delta"], "draft");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(writer.events().len(), 1);
+
+        let mut prospect = writer.prospect().clone();
+        prospect.constrained = Some(json!({ "answer": "draft" }));
+        let done: Value = serde_json::from_str(&render_done(&prospect, true).unwrap()).unwrap();
+        assert_eq!(done["type"], "done");
+        assert_eq!(done["content"], "draft");
+        assert_eq!(done["constrained"]["answer"], "draft");
+    }
+
+    #[tokio::test]
     async fn final_events_are_recorded_only_once() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut sink = Sink::channel(tx);
@@ -710,6 +748,7 @@ mod tests {
             content: "answer".to_string(),
             tool_calls: vec![json!({ "call_id": "call_1" })],
             provider_continuation: None,
+            constrained: None,
         };
 
         let structured: Value =
@@ -744,6 +783,7 @@ mod tests {
             content: "answer".to_string(),
             tool_calls: Vec::new(),
             provider_continuation: None,
+            constrained: None,
         };
         let events = vec![
             json!({ "type": "reasoning_delta", "delta": "because" }),
@@ -762,5 +802,20 @@ mod tests {
         assert_eq!(lines[1], json!({ "type": "content_delta", "delta": "wer" }));
         assert_eq!(lines[2]["type"], "done");
         assert_eq!(lines[2]["reasoning"], Value::Null);
+    }
+
+    #[test]
+    fn simple_rendering_prefers_constrained_output_when_present() {
+        let prospect = Prospect {
+            reasoning: Some("because".to_string()),
+            content: "draft".to_string(),
+            tool_calls: Vec::new(),
+            provider_continuation: None,
+            constrained: Some(json!({ "title": "Brazil" })),
+        };
+
+        let simple = render_cached(&prospect, None, true, false, true).unwrap();
+
+        assert_eq!(simple, "{\n  \"title\": \"Brazil\"\n}\n");
     }
 }
