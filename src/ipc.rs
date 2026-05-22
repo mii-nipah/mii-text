@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crate::args::ClientArgs;
@@ -51,6 +52,8 @@ pub enum Frame {
         assistant: Option<String>,
         #[serde(default)]
         provider_continuation: Option<ProviderContinuation>,
+        #[serde(default)]
+        constrained: Option<Value>,
     },
 }
 

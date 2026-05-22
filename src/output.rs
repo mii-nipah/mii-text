@@ -10,6 +10,8 @@ pub struct Prospect {
     pub content: String,
     pub tool_calls: Vec<Value>,
     pub provider_continuation: Option<ProviderContinuation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,18 +179,7 @@ impl OutputWriter {
             if let Some(continuation) = &prospect.provider_continuation {
                 write_jsonl(sink, mirror, continuation.stream_event()).await?;
             }
-            write_jsonl(
-                sink,
-                mirror,
-                json!({
-                    "type": "done",
-                    "reasoning": prospect.reasoning,
-                    "content": prospect.content,
-                    "tool_calls": prospect.tool_calls,
-                    "provider_continuation": prospect.provider_continuation,
-                }),
-            )
-            .await?;
+            write_jsonl(sink, mirror, done_event(&prospect)).await?;
             return Ok(());
         }
 
@@ -255,6 +246,13 @@ fn visible_prospect(prospect: &Prospect, emit_reasoning: bool) -> Prospect {
 }
 
 fn simple_text(prospect: &Prospect) -> Result<String, String> {
+    if let Some(constrained) = &prospect.constrained {
+        let mut text = serde_json::to_string_pretty(constrained)
+            .map_err(|e| format!("serialize constrained output: {}", e))?;
+        text.push('\n');
+        return Ok(text);
+    }
+
     let mut text = String::new();
     if let Some(reasoning) = &prospect.reasoning {
         text.push_str("<think>");
@@ -291,16 +289,7 @@ fn render_jsonl(prospect: &Prospect) -> Result<String, String> {
             json!({ "type": "tool_calls", "tool_calls": prospect.tool_calls }),
         )?;
     }
-    push_jsonl(
-        &mut text,
-        json!({
-            "type": "done",
-            "reasoning": prospect.reasoning,
-            "content": prospect.content,
-            "tool_calls": prospect.tool_calls,
-            "provider_continuation": prospect.provider_continuation,
-        }),
-    )?;
+    push_jsonl(&mut text, done_event(prospect))?;
     Ok(text)
 }
 
@@ -316,16 +305,7 @@ fn render_jsonl_events(
         }
         push_jsonl(&mut text, event.clone())?;
     }
-    push_jsonl(
-        &mut text,
-        json!({
-            "type": "done",
-            "reasoning": prospect.reasoning,
-            "content": prospect.content,
-            "tool_calls": prospect.tool_calls,
-            "provider_continuation": prospect.provider_continuation,
-        }),
-    )?;
+    push_jsonl(&mut text, done_event(prospect))?;
     Ok(text)
 }
 
@@ -334,6 +314,20 @@ fn render_structured(prospect: &Prospect) -> Result<String, String> {
         serde_json::to_string_pretty(prospect).map_err(|e| format!("serialize output: {}", e))?;
     text.push('\n');
     Ok(text)
+}
+
+fn done_event(prospect: &Prospect) -> Value {
+    let mut event = json!({
+        "type": "done",
+        "reasoning": prospect.reasoning,
+        "content": prospect.content,
+        "tool_calls": prospect.tool_calls,
+        "provider_continuation": prospect.provider_continuation,
+    });
+    if let Some(constrained) = &prospect.constrained {
+        event["constrained"] = constrained.clone();
+    }
+    event
 }
 
 fn push_jsonl(out: &mut String, value: Value) -> Result<(), String> {
@@ -385,6 +379,7 @@ mod tests {
             content: "hello".to_string(),
             tool_calls: vec![json!({ "name": "echo" })],
             provider_continuation: None,
+            constrained: None,
         };
         let value = serde_json::to_value(prospect).unwrap();
 
@@ -710,6 +705,7 @@ mod tests {
             content: "answer".to_string(),
             tool_calls: vec![json!({ "call_id": "call_1" })],
             provider_continuation: None,
+            constrained: None,
         };
 
         let structured: Value =
@@ -744,6 +740,7 @@ mod tests {
             content: "answer".to_string(),
             tool_calls: Vec::new(),
             provider_continuation: None,
+            constrained: None,
         };
         let events = vec![
             json!({ "type": "reasoning_delta", "delta": "because" }),
@@ -762,5 +759,20 @@ mod tests {
         assert_eq!(lines[1], json!({ "type": "content_delta", "delta": "wer" }));
         assert_eq!(lines[2]["type"], "done");
         assert_eq!(lines[2]["reasoning"], Value::Null);
+    }
+
+    #[test]
+    fn simple_rendering_prefers_constrained_output_when_present() {
+        let prospect = Prospect {
+            reasoning: Some("because".to_string()),
+            content: "draft".to_string(),
+            tool_calls: Vec::new(),
+            provider_continuation: None,
+            constrained: Some(json!({ "title": "Brazil" })),
+        };
+
+        let simple = render_cached(&prospect, None, true, false, true).unwrap();
+
+        assert_eq!(simple, "{\n  \"title\": \"Brazil\"\n}\n");
     }
 }

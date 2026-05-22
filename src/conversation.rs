@@ -36,6 +36,7 @@ impl Message {
 
     pub fn to_api_value(&self) -> Value {
         let mut object = self.extra.clone();
+        object.remove("constrained");
         if !self.role.is_empty() {
             object.insert("role".to_string(), Value::String(self.role.clone()));
         }
@@ -54,8 +55,15 @@ pub fn push_assistant_turn(
     messages: &mut Vec<Message>,
     content: String,
     continuation: Option<&ProviderContinuation>,
+    constrained: Option<&Value>,
 ) -> Result<(), String> {
-    messages.push(Message::assistant(content));
+    let mut assistant = Message::assistant(content);
+    if let Some(constrained) = constrained {
+        assistant
+            .extra
+            .insert("constrained".to_string(), constrained.clone());
+    }
+    messages.push(assistant);
     if let Some(continuation) = continuation {
         messages.push(Message::from_value(continuation.stream_event())?);
     }
@@ -204,7 +212,13 @@ mod tests {
             })],
         };
 
-        push_assistant_turn(&mut messages, "answer".to_string(), Some(&continuation)).unwrap();
+        push_assistant_turn(
+            &mut messages,
+            "answer".to_string(),
+            Some(&continuation),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].to_api_value()["role"], "assistant");
@@ -225,6 +239,25 @@ mod tests {
         assert_eq!(value["role"], "assistant");
         assert!(value.get("content").is_none());
         assert_eq!(value["tool_calls"], json!([]));
+    }
+
+    #[test]
+    fn constrained_assistant_metadata_is_saved_but_not_sent_as_context() {
+        let mut messages = Vec::new();
+
+        push_assistant_turn(
+            &mut messages,
+            "draft".to_string(),
+            None,
+            Some(&json!({ "title": "Brazil" })),
+        )
+        .unwrap();
+
+        let saved = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(saved["constrained"]["title"], "Brazil");
+        let api = messages[0].to_api_value();
+        assert!(api.get("constrained").is_none());
+        assert_eq!(api["content"], "draft");
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::args::map_reasoning;
+use crate::constraints;
 use crate::conversation::is_provider_continuation_value;
 use crate::output::{OutputWriter, ProviderContinuation};
 use crate::sink::Sink;
@@ -82,6 +83,9 @@ pub async fn call(
     }
     if let Some(tool_defs) = params.tools {
         body["tools"] = Value::Array(tools::for_responses(tool_defs));
+    }
+    if let Some(schema) = params.schema {
+        body["text"] = constraints::text_format_for_responses(schema);
     }
 
     let mut full_output = String::new();

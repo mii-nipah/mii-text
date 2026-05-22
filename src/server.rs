@@ -144,6 +144,7 @@ async fn handle_connection(
                     code: 0,
                     assistant: None,
                     provider_continuation: None,
+                    constrained: None,
                 },
             )
             .await?;
@@ -169,6 +170,7 @@ async fn handle_connection(
         max_tokens,
         reasoning_summary,
         tools,
+        schema,
         completions,
         simple,
     } = args;
@@ -187,6 +189,7 @@ async fn handle_connection(
         max_tokens,
         reasoning_summary,
         tools,
+        schema,
         completions,
         simple,
     };
@@ -244,20 +247,20 @@ async fn handle_connection(
         loop {
             tokio::select! {
                 biased;
-                text = text_rx.recv() => if let Some(t) = text {
-                    if write_json_line(&mut send, &Frame::Stdout { text: t }).await.is_err() {
-                        log!(quiet, "#{} client gone (write failed); cancelling generation", id);
-                        return Ok(());
-                    }
+                text = text_rx.recv() => if let Some(t) = text
+                    && write_json_line(&mut send, &Frame::Stdout { text: t }).await.is_err()
+                {
+                    log!(quiet, "#{} client gone (write failed); cancelling generation", id);
+                    return Ok(());
                 },
-                err = err_rx.recv() => if let Some(t) = err {
-                    if write_json_line(&mut send, &Frame::Stderr { text: t }).await.is_err() {
-                        log!(quiet, "#{} client gone (write failed); cancelling generation", id);
-                        return Ok(());
-                    }
+                err = err_rx.recv() => if let Some(t) = err
+                    && write_json_line(&mut send, &Frame::Stderr { text: t }).await.is_err()
+                {
+                    log!(quiet, "#{} client gone (write failed); cancelling generation", id);
+                    return Ok(());
                 },
                 peek = reader.fill_buf(), if client_alive => match peek {
-                    Ok(buf) if buf.is_empty() => {
+                    Ok([]) => {
                         log!(quiet, "#{} client disconnected; cancelling generation", id);
                         return Ok(());
                     }
@@ -283,8 +286,13 @@ async fn handle_connection(
         write_json_line(&mut send, &Frame::Stderr { text: t }).await?;
     }
 
-    let (code, assistant, provider_continuation) = match outcome {
-        Ok(o) => (o.exit_code, Some(o.assistant_buf), o.provider_continuation),
+    let (code, assistant, provider_continuation, constrained) = match outcome {
+        Ok(o) => (
+            o.exit_code,
+            Some(o.assistant_buf),
+            o.provider_continuation,
+            o.constrained,
+        ),
         Err((code, msg)) => {
             write_json_line(
                 &mut send,
@@ -293,7 +301,7 @@ async fn handle_connection(
                 },
             )
             .await?;
-            (code, None, None)
+            (code, None, None, None)
         }
     };
     write_json_line(
@@ -302,6 +310,7 @@ async fn handle_connection(
             code,
             assistant,
             provider_continuation,
+            constrained,
         },
     )
     .await?;
@@ -335,6 +344,7 @@ fn clone_args(a: &Args) -> Args {
         max_tokens: a.max_tokens,
         reasoning_summary: a.reasoning_summary,
         tools: a.tools.clone(),
+        schema: a.schema.clone(),
         completions: a.completions,
         simple: a.simple,
         serve: false,
@@ -373,6 +383,7 @@ mod tests {
             tools: vec![ToolSource::Inline(
                 "{\"name\":\"echo\",\"input_schema\":{\"type\":\"object\"}}".to_string(),
             )],
+            schema: Some("{\"type\":\"object\"}".to_string()),
             completions: true,
             simple: true,
             serve: true,
@@ -409,6 +420,7 @@ mod tests {
         assert_eq!(cloned.max_tokens, Some(123));
         assert!(cloned.reasoning_summary);
         assert_eq!(cloned.tools.len(), 1);
+        assert_eq!(cloned.schema.as_deref(), Some("{\"type\":\"object\"}"));
         assert!(cloned.completions);
         assert!(cloned.simple);
         assert!(!cloned.serve);

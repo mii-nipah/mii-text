@@ -6,6 +6,7 @@ use interprocess::local_socket::{GenericFilePath, ToFsName};
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use crate::args::{Args, default_ipc_socket};
+use crate::constraints;
 use crate::conversation::{
     Message, load_input_messages, load_stateful, push_assistant_turn, read_stdin_to_string,
     save_stateful,
@@ -91,6 +92,11 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
         let resolved = tools::resolve(&args.tools).await?.unwrap_or_default();
         client_args.tools = tools::resolved_sources(resolved);
     }
+    if let Some(schema) = &args.schema {
+        let resolved = constraints::resolve_schema(schema).await?;
+        client_args.schema =
+            Some(serde_json::to_string(&resolved).map_err(|e| format!("serialize schema: {}", e))?);
+    }
 
     let conn = connect(&socket_path).await?;
     let (recv, mut send) = conn.split();
@@ -114,6 +120,7 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
     let mut exit_code: u8 = 1;
     let mut assistant: Option<String> = None;
     let mut provider_continuation = None;
+    let mut constrained = None;
 
     while let Some(frame) = read_json_line::<Frame, _>(&mut reader)
         .await
@@ -134,10 +141,12 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
                 code,
                 assistant: a,
                 provider_continuation: continuation,
+                constrained: value,
             } => {
                 exit_code = code;
                 assistant = a;
                 provider_continuation = continuation;
+                constrained = value;
                 break;
             }
             Frame::Status { .. } => {
@@ -151,7 +160,12 @@ pub async fn run_ipc(args: Args) -> Result<u8, String> {
         .map_err(|e| format!("flush output: {}", e))?;
 
     if let (Some(p), Some(text)) = (&args.stateful, assistant) {
-        push_assistant_turn(&mut conversation, text, provider_continuation.as_ref())?;
+        push_assistant_turn(
+            &mut conversation,
+            text,
+            provider_continuation.as_ref(),
+            constrained.as_ref(),
+        )?;
         save_stateful(p, &conversation).await?;
     }
 

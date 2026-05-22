@@ -22,6 +22,7 @@ pub struct CallParams<'a> {
     pub reasoning_summary: bool,
     pub stats: bool,
     pub tools: &'a Option<Vec<Value>>,
+    pub schema: Option<&'a Value>,
     pub completions: bool,
     pub simple: bool,
 }

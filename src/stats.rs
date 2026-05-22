@@ -71,10 +71,10 @@ pub fn format_stats(
             push_usage(&mut out, u);
             let completion = u.get("completion_tokens").and_then(|v| v.as_u64());
             let secs = total.as_secs_f64();
-            if let Some(c) = completion {
-                if secs > 0.0 {
-                    let _ = writeln!(out, "throughput: {:.1} tok/s", c as f64 / secs);
-                }
+            if let Some(c) = completion
+                && secs > 0.0
+            {
+                let _ = writeln!(out, "throughput: {:.1} tok/s", c as f64 / secs);
             }
         }
         None => {
@@ -82,6 +82,21 @@ pub fn format_stats(
         }
     }
     out
+}
+
+pub fn combine_usage(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(usage), None) | (None, Some(usage)) => Some(usage),
+        (Some(first), Some(second)) => Some(json!({
+            "prompt_tokens": numeric_field(&first, "prompt_tokens") + numeric_field(&second, "prompt_tokens"),
+            "completion_tokens": numeric_field(&first, "completion_tokens") + numeric_field(&second, "completion_tokens"),
+            "total_tokens": numeric_field(&first, "total_tokens") + numeric_field(&second, "total_tokens"),
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens(&first) + reasoning_tokens(&second),
+            }
+        })),
+    }
 }
 
 pub fn format_cached_stats(
@@ -121,6 +136,18 @@ fn push_usage(out: &mut String, u: &Value) {
     if let Some(t) = total_tok {
         let _ = writeln!(out, "total tokens: {}", t);
     }
+}
+
+fn numeric_field(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn reasoning_tokens(value: &Value) -> u64 {
+    value
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -205,5 +232,29 @@ mod tests {
         assert!(cached.contains("--- stats (cached) ---"));
         assert!(cached.contains("model: model-b"));
         assert!(cached.contains("total tokens: 5"));
+    }
+
+    #[test]
+    fn combine_usage_sums_known_token_fields_for_two_pass_requests() {
+        let usage = combine_usage(
+            Some(json!({
+                "prompt_tokens": 2,
+                "completion_tokens": 3,
+                "total_tokens": 5,
+                "completion_tokens_details": { "reasoning_tokens": 1 }
+            })),
+            Some(json!({
+                "prompt_tokens": 7,
+                "completion_tokens": 11,
+                "total_tokens": 18,
+                "completion_tokens_details": { "reasoning_tokens": 4 }
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(usage["prompt_tokens"], 9);
+        assert_eq!(usage["completion_tokens"], 14);
+        assert_eq!(usage["total_tokens"], 23);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 5);
     }
 }

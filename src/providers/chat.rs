@@ -6,6 +6,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::args::map_reasoning;
+use crate::constraints;
 use crate::conversation::build_chat_messages;
 use crate::output::OutputWriter;
 use crate::sink::Sink;
@@ -33,6 +34,9 @@ pub async fn call(
     }
     if let Some(tool_defs) = params.tools {
         body["tools"] = Value::Array(tools::for_chat(tool_defs));
+    }
+    if let Some(schema) = params.schema {
+        body["response_format"] = constraints::response_format_for_chat(schema);
     }
     body["max_completion_tokens"] = json!(params.max_tokens);
     // Note: `--reasoning-summary` doesn't add a request field for chat
